@@ -302,6 +302,11 @@ class DriveProcessor:
         self.meta: Optional[Meta] = None
         self.authorized = False
         self.temp_dir = os.path.join(TEMP_ROOT, drive_letter.replace(':', '').replace('\\', ''))
+        self._mapping: Dict[str, str] = {}
+        self._reverse_mapping: Dict[str, str] = {}
+        self._sync_thread: Optional[threading.Thread] = None
+        self._sync_stop = threading.Event()
+        self._last_view_state: Dict[str, Tuple[float, int]] = {}
 
     def load_or_init(self) -> Tuple[bool, str]:
         self.meta = load_wrapped_keys(self.root)
@@ -410,6 +415,8 @@ class DriveProcessor:
             print('No mapping metadata to build view.')
             return
         mapping = payload['mapping']
+        self._mapping = dict(mapping)
+        self._reverse_mapping = {v: k for k, v in mapping.items()}
         os.makedirs(self.temp_dir, exist_ok=True)
         for token, orig_rel in mapping.items():
             enc_path = os.path.join(self.root, token)
@@ -432,8 +439,10 @@ class DriveProcessor:
             os.startfile(self.temp_dir)
         except Exception:
             pass
+        self._start_sync_loop()
 
     def cleanup_temp(self):
+        self._stop_sync_loop()
         try:
             if os.path.exists(self.temp_dir):
                 for dirpath, dirnames, filenames in os.walk(self.temp_dir, topdown=False):
@@ -454,6 +463,83 @@ class DriveProcessor:
                     pass
         except Exception:
             pass
+
+    # ----------------------------- Temp sync loop -----------------------------
+    def _start_sync_loop(self):
+        if self._sync_thread and self._sync_thread.is_alive():
+            return
+        self._sync_stop.clear()
+        self._sync_thread = threading.Thread(target=self._sync_worker, daemon=True)
+        self._sync_thread.start()
+
+    def _stop_sync_loop(self):
+        self._sync_stop.set()
+        if self._sync_thread and self._sync_thread.is_alive():
+            self._sync_thread.join(timeout=1.5)
+        self._sync_thread = None
+
+    def _sync_worker(self):
+        while not self._sync_stop.is_set():
+            try:
+                self._sync_temp_changes()
+            except Exception:
+                traceback.print_exc()
+            self._sync_stop.wait(1.5)
+
+    def _sync_temp_changes(self):
+        current_state: Dict[str, Tuple[float, int]] = {}
+        for dirpath, dirnames, filenames in os.walk(self.temp_dir):
+            for fn in filenames:
+                full = os.path.join(dirpath, fn)
+                rel = os.path.relpath(full, self.temp_dir).replace('\\', '/')
+                try:
+                    stat = os.stat(full)
+                    current_state[rel] = (stat.st_mtime, stat.st_size)
+                except FileNotFoundError:
+                    continue
+
+        for rel, meta in current_state.items():
+            if rel not in self._last_view_state or self._last_view_state[rel] != meta:
+                self._encrypt_back(rel)
+
+        for rel in set(self._last_view_state.keys()) - set(current_state.keys()):
+            self._handle_deletion(rel)
+
+        self._last_view_state = current_state
+
+    def _encrypt_back(self, rel: str):
+        full = os.path.join(self.temp_dir, rel.replace('/', os.sep))
+        try:
+            with open(full, 'rb') as f:
+                data = f.read()
+        except FileNotFoundError:
+            return
+
+        token = self._reverse_mapping.get(rel)
+        if not token:
+            token = obfuscate_filename(rel, self.master_key)
+            while os.path.exists(os.path.join(self.root, token)):
+                token = obfuscate_filename(rel + '_' + base64.urlsafe_b64encode(os.urandom(3)).decode('utf-8'), self.master_key)
+            self._mapping[token] = rel
+            self._reverse_mapping[rel] = token
+
+        enc = encrypt_content_bytes(data, self.master_key)
+        enc_path = os.path.join(self.root, token)
+        with open(enc_path, 'wb') as f:
+            f.write(enc)
+        save_meta_encrypted(self.root, self.master_key, {'mapping': self._mapping, 'created_by': self.hwid})
+
+    def _handle_deletion(self, rel: str):
+        token = self._reverse_mapping.get(rel)
+        if not token:
+            return
+        try:
+            os.remove(os.path.join(self.root, token))
+        except FileNotFoundError:
+            pass
+        self._reverse_mapping.pop(rel, None)
+        self._mapping.pop(token, None)
+        save_meta_encrypted(self.root, self.master_key, {'mapping': self._mapping, 'created_by': self.hwid})
 
 
 # ----------------------------- Utilities ------------------------------------
