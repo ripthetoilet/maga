@@ -615,6 +615,15 @@ def get_drive_identifier(drive: str) -> str:
         return drive.replace(':', '').replace('\\', '')
 
 
+def get_drive_label(drive: str) -> str:
+    try:
+        label, serial, _, _, _ = win32api.GetVolumeInformation(drive)
+        parts = [p for p in [label, serial] if p]
+        return " | ".join(parts) if parts else drive.rstrip('\\')
+    except Exception:
+        return drive.rstrip('\\')
+
+
 def is_drive_allowed(drive: str) -> bool:
     cfg = load_config()
     drive_id = get_drive_identifier(drive)
@@ -626,7 +635,7 @@ def add_allowed_drive(drive: str) -> bool:
         return False
     cfg = load_config()
     drive_id = get_drive_identifier(drive)
-    label = drive.rstrip('\\')
+    label = get_drive_label(drive)
     cfg.setdefault('allowed', {})[drive_id] = label
     save_config(cfg)
     print(f"Drive {drive} added to local allowlist.")
@@ -762,11 +771,14 @@ def choose_drive_interactive() -> Optional[str]:
         print('No removable drives found.')
         return None
     print('Removable drives:')
-    for i, d in enumerate(drives):
-        print(f'  [{i}] {d}')
+    for i, d in enumerate(drives, start=1):
+        label = get_drive_label(d)
+        print(f'  [{i}] {d} ({label})')
     sel = input('Choose drive number: ').strip()
     try:
-        idx = int(sel)
+        idx = int(sel) - 1
+        if idx < 0:
+            raise ValueError
         return drives[idx]
     except Exception:
         print('Invalid selection')
@@ -804,17 +816,23 @@ class SimpleGUI:
         ttk.Button(btn_frame, text='Admin decrypt', command=self.admin_decrypt).pack(side=tk.LEFT, padx=4)
 
         self.refresh()
+        self.monitor.start_background()
 
     def refresh(self):
         for item in self.tree.get_children():
             self.tree.delete(item)
         cfg = load_config()
-        for drive in list_connected_drives():
-            drive_id = get_drive_identifier(drive)
-            allowed = drive_id in cfg.get('allowed', {})
-            status = 'allowed' if allowed else 'blocked'
-            label = cfg.get('allowed', {}).get(drive_id, drive_id)
-            self.tree.insert('', 'end', iid=drive, values=(status, f"{drive} | {label}"))
+        connected = {get_drive_identifier(d): d for d in list_connected_drives()}
+        for drive_id, label in cfg.get('allowed', {}).items():
+            drive = connected.get(drive_id, '')
+            status = 'allowed (connected)' if drive else 'allowed (not connected)'
+            display = f"{drive or '—'} | {label}"
+            self.tree.insert('', 'end', iid=drive or drive_id, values=(status, display))
+        for drive_id, drive in connected.items():
+            if drive_id in cfg.get('allowed', {}):
+                continue
+            label = get_drive_label(drive)
+            self.tree.insert('', 'end', iid=drive, values=('blocked', f"{drive} | {label}"))
 
     def _selected_drive(self) -> Optional[str]:
         sel = self.tree.selection()
@@ -832,6 +850,9 @@ class SimpleGUI:
         d = self._selected_drive()
         if not d:
             messagebox.showwarning('USB Protector', 'Select a drive first.')
+            return
+        if ':' not in d:
+            messagebox.showwarning('USB Protector', 'Insert the USB drive before allowing it.')
             return
         if add_allowed_drive(d):
             self.refresh()
@@ -862,14 +883,17 @@ class SimpleGUI:
 def main_menu():
     ensure_windows()
     ensure_autostart()
+    monitor = USBMonitor()
+    monitor.start_background()
     while True:
         print('\n- main menu -')
         print('1) (Admin) Initialize & Encrypt (lock forever) - choose USB to encrypt')
         print('2) (Admin) Permanently Decrypt (restore) - choose USB to restore')
         print('3) View (temporary decrypted view while running)')
         print('4) Show connected drives and allowlist status')
-        print('5) (Admin) Add connected USB to local allowlist')
-        print('6) Exit')
+        print('5) Show allowed USB list for this PC')
+        print('6) (Admin) Add connected USB to local allowlist')
+        print('7) Exit')
         choice = input('Select: ').strip()
         if choice == '1':
             if not require_admin_password():
@@ -911,15 +935,25 @@ def main_menu():
             for drive in list_connected_drives():
                 allowed = 'allowed' if is_drive_allowed(drive) else 'blocked'
                 drive_id = get_drive_identifier(drive)
-                label = cfg.get('allowed', {}).get(drive_id, drive_id)
+                label = cfg.get('allowed', {}).get(drive_id, get_drive_label(drive))
                 print(f"  {drive} -> {label} ({allowed})")
         elif choice == '5':
+            cfg = load_config()
+            allowed = cfg.get('allowed', {})
+            if not allowed:
+                print('No USB drives are currently allowed on this PC.')
+            else:
+                print('Allowed USB drives for this PC:')
+                for idx, (drive_id, label) in enumerate(allowed.items(), start=1):
+                    print(f'  [{idx}] {label} ({drive_id})')
+        elif choice == '6':
             d = choose_drive_interactive()
             if not d:
                 continue
             add_allowed_drive(d)
-        elif choice == '6':
+        elif choice == '7':
             print('Exit')
+            monitor.stop()
             break
         else:
             print('Unknown option')

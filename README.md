@@ -11,7 +11,7 @@ This document summarizes the architecture implemented by `usb_protector.py` and 
 ## High-level flow
 1. **HWID-based key derivation**: On startup the program fetches a hardware identifier (BIOS serial fallback to volume ID or `COMPUTERNAME`) and derives a wrapping key using PBKDF2-HMAC-SHA256 with a built-in salt.
 2. **Master key handling**: A random 256-bit master key encrypts drive contents. The master key is wrapped per HWID (`aes_key_wrap`) and stored in hidden metadata on the drive. Multiple authorized PCs can add their wrapped copy.
-3. **Drive detection**: Using `pywin32` the app polls logical drives, filtering for removable drives. Newly detected drives are inspected for metadata; authorized drives are given a temporary decrypted view that stays in sync with the encrypted media.
+3. **Drive detection**: Using `pywin32` the app polls logical drives, filtering for removable drives. Newly detected drives are inspected for metadata; authorized drives are given a temporary decrypted view that stays in sync with the encrypted media and opens automatically when the program is running.
 4. **File encryption format**: Files are encrypted with AES-GCM. A header stores a tag, version byte, nonce, and original size. Filenames are obfuscated via AES-GCM then URL-safe Base64 so the drive surface contains only opaque tokens.
 5. **Metadata**: Hidden folder `.usb_protect_meta` contains `wrapped_keys.json` (wrapped master keys indexed by HWID hash) and `meta.enc` (AES-GCM-encrypted JSON mapping of encrypted tokens to original relative paths).
 6. **Operations**:
@@ -31,11 +31,12 @@ GUI (starts minimized, creates auto-start entry on first run):
 python usb_protector.py --gui
 ```
 
-Choose from the interactive menu:
+Choose from the interactive menu (background monitoring is active so allowed encrypted drives open automatically when attached):
 - **Initialize & Encrypt** (admin): destructively encrypts a selected removable drive (with optional zip backup) after an explicit `y/n` confirmation.
 - **Permanently Decrypt** (admin): restores an encrypted drive when run on an authorized PC.
 - **View**: starts a monitor that auto-decrypts files to a temp view for allowed drives while running, automatically opens that folder when an allowed drive is inserted, and syncs any edits back to encrypted storage.
-- **Show connected drives**: prints all mounted drives with allowlist status for the current PC.
+- **Show connected drives**: prints all mounted drives with allowlist status and human-friendly labels for the current PC.
+- **Show allowed drives for this PC**: lists every USB that has been allowed locally (even if it is not currently connected).
 - **Add to allowlist** (admin): marks a specific USB as allowed on this PC; other drives remain blocked from auto-decrypt.
 
 ## Deployment notes
