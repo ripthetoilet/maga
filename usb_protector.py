@@ -670,8 +670,12 @@ def main_menu():
             d = choose_drive_interactive()
             if not d:
                 continue
-            confirm = input(f"This WILL destructively encrypt drive {d}. Continue? (type 'YES' to proceed): ")
-            if confirm != 'YES':
+            while True:
+                confirm = input(f"This WILL destructively encrypt drive {d}. Continue? (y/n): ").strip().lower()
+                if confirm in {'y', 'n'}:
+                    break
+                print("Please press 'y' to proceed or 'n' to cancel.")
+            if confirm != 'y':
                 print('Aborted')
                 continue
             dp = DriveProcessor(d)
