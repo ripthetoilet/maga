@@ -26,9 +26,9 @@ python usb_protector.py
 ```
 
 Choose from the interactive menu:
-- **Initialize & Encrypt**: destructively encrypts a selected removable drive (with optional zip backup) after an explicit `y/n` confirmation.
+- **Initialize & Encrypt**: destructively encrypts a selected removable drive (with optional zip backup).
 - **Permanently Decrypt**: restores an encrypted drive when run on an authorized PC.
-- **View**: starts a monitor that auto-decrypts files to a temp view for authorized drives while running, automatically opens that folder when an authorized drive is inserted, and syncs any edits back to encrypted storage.
+- **View**: starts a monitor that auto-decrypts files to a temp view for authorized drives while running and syncs any edits back to encrypted storage.
 
 ## Deployment notes
 - Convert to a Windows service or add to Startup for auto-run.
