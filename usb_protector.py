@@ -34,6 +34,11 @@ import struct
 import tempfile
 import threading
 import traceback
+import getpass
+import hashlib
+import winreg
+import tkinter as tk
+from tkinter import ttk, messagebox
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple
 
@@ -63,6 +68,8 @@ FILE_TAG = b"USBPROT1"
 FILE_VERSION = 1
 POLL_INTERVAL = 2
 TEMP_ROOT = os.path.join(tempfile.gettempdir(), "usb_protect_view")
+CONFIG_ROOT = os.path.join(os.getenv('APPDATA', tempfile.gettempdir()), "usb_protector")
+CONFIG_PATH = os.path.join(CONFIG_ROOT, "config.json")
 MAX_AUTO_DECRYPT = 300 * 1024 * 1024
 # -----------------------------------------------------------------------------
 
@@ -71,6 +78,30 @@ def ensure_windows():
     if os.name != 'nt' or win32file is None:
         print("This program runs on Windows and requires pywin32.")
         sys.exit(1)
+
+
+def ensure_config_dir():
+    os.makedirs(CONFIG_ROOT, exist_ok=True)
+
+
+def load_config() -> dict:
+    ensure_config_dir()
+    if not os.path.exists(CONFIG_PATH):
+        return {"admin_hash": "", "allowed": {}}
+    try:
+        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        data.setdefault("admin_hash", "")
+        data.setdefault("allowed", {})
+        return data
+    except Exception:
+        return {"admin_hash": "", "allowed": {}}
+
+
+def save_config(cfg: dict) -> None:
+    ensure_config_dir()
+    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
 
 
 # ----------------------------- HWID & KDF -----------------------------------
@@ -109,6 +140,32 @@ def derive_wrapping_key(hwid: str, salt: bytes = PROGRAM_SALT) -> bytes:
         backend=default_backend(),
     )
     return kdf.derive(hwid_bytes)
+
+
+def _hash_password(pw: str) -> str:
+    h = hashlib.sha256()
+    h.update(pw.encode('utf-8'))
+    return h.hexdigest()
+
+
+def require_admin_password(prompt: str = 'Admin password: ') -> bool:
+    cfg = load_config()
+    if not cfg.get('admin_hash'):
+        print('No admin password set. Create a new one now.')
+        pw1 = getpass.getpass('New admin password: ')
+        pw2 = getpass.getpass('Repeat password: ')
+        if not pw1 or pw1 != pw2:
+            print('Passwords did not match.')
+            return False
+        cfg['admin_hash'] = _hash_password(pw1)
+        save_config(cfg)
+        print('Admin password set.')
+        return True
+    pw = getpass.getpass(prompt)
+    if _hash_password(pw) == cfg['admin_hash']:
+        return True
+    print('Admin authentication failed.')
+    return False
 
 
 # ----------------------------- Metadata helpers -----------------------------
@@ -302,6 +359,11 @@ class DriveProcessor:
         self.meta: Optional[Meta] = None
         self.authorized = False
         self.temp_dir = os.path.join(TEMP_ROOT, drive_letter.replace(':', '').replace('\\', ''))
+        self._mapping: Dict[str, str] = {}
+        self._reverse_mapping: Dict[str, str] = {}
+        self._sync_thread: Optional[threading.Thread] = None
+        self._sync_stop = threading.Event()
+        self._last_view_state: Dict[str, Tuple[float, int]] = {}
 
     def load_or_init(self) -> Tuple[bool, str]:
         self.meta = load_wrapped_keys(self.root)
@@ -410,6 +472,8 @@ class DriveProcessor:
             print('No mapping metadata to build view.')
             return
         mapping = payload['mapping']
+        self._mapping = dict(mapping)
+        self._reverse_mapping = {v: k for k, v in mapping.items()}
         os.makedirs(self.temp_dir, exist_ok=True)
         for token, orig_rel in mapping.items():
             enc_path = os.path.join(self.root, token)
@@ -432,8 +496,10 @@ class DriveProcessor:
             os.startfile(self.temp_dir)
         except Exception:
             pass
+        self._start_sync_loop()
 
     def cleanup_temp(self):
+        self._stop_sync_loop()
         try:
             if os.path.exists(self.temp_dir):
                 for dirpath, dirnames, filenames in os.walk(self.temp_dir, topdown=False):
@@ -455,6 +521,83 @@ class DriveProcessor:
         except Exception:
             pass
 
+    # ----------------------------- Temp sync loop -----------------------------
+    def _start_sync_loop(self):
+        if self._sync_thread and self._sync_thread.is_alive():
+            return
+        self._sync_stop.clear()
+        self._sync_thread = threading.Thread(target=self._sync_worker, daemon=True)
+        self._sync_thread.start()
+
+    def _stop_sync_loop(self):
+        self._sync_stop.set()
+        if self._sync_thread and self._sync_thread.is_alive():
+            self._sync_thread.join(timeout=1.5)
+        self._sync_thread = None
+
+    def _sync_worker(self):
+        while not self._sync_stop.is_set():
+            try:
+                self._sync_temp_changes()
+            except Exception:
+                traceback.print_exc()
+            self._sync_stop.wait(1.5)
+
+    def _sync_temp_changes(self):
+        current_state: Dict[str, Tuple[float, int]] = {}
+        for dirpath, dirnames, filenames in os.walk(self.temp_dir):
+            for fn in filenames:
+                full = os.path.join(dirpath, fn)
+                rel = os.path.relpath(full, self.temp_dir).replace('\\', '/')
+                try:
+                    stat = os.stat(full)
+                    current_state[rel] = (stat.st_mtime, stat.st_size)
+                except FileNotFoundError:
+                    continue
+
+        for rel, meta in current_state.items():
+            if rel not in self._last_view_state or self._last_view_state[rel] != meta:
+                self._encrypt_back(rel)
+
+        for rel in set(self._last_view_state.keys()) - set(current_state.keys()):
+            self._handle_deletion(rel)
+
+        self._last_view_state = current_state
+
+    def _encrypt_back(self, rel: str):
+        full = os.path.join(self.temp_dir, rel.replace('/', os.sep))
+        try:
+            with open(full, 'rb') as f:
+                data = f.read()
+        except FileNotFoundError:
+            return
+
+        token = self._reverse_mapping.get(rel)
+        if not token:
+            token = obfuscate_filename(rel, self.master_key)
+            while os.path.exists(os.path.join(self.root, token)):
+                token = obfuscate_filename(rel + '_' + base64.urlsafe_b64encode(os.urandom(3)).decode('utf-8'), self.master_key)
+            self._mapping[token] = rel
+            self._reverse_mapping[rel] = token
+
+        enc = encrypt_content_bytes(data, self.master_key)
+        enc_path = os.path.join(self.root, token)
+        with open(enc_path, 'wb') as f:
+            f.write(enc)
+        save_meta_encrypted(self.root, self.master_key, {'mapping': self._mapping, 'created_by': self.hwid})
+
+    def _handle_deletion(self, rel: str):
+        token = self._reverse_mapping.get(rel)
+        if not token:
+            return
+        try:
+            os.remove(os.path.join(self.root, token))
+        except FileNotFoundError:
+            pass
+        self._reverse_mapping.pop(rel, None)
+        self._mapping.pop(token, None)
+        save_meta_encrypted(self.root, self.master_key, {'mapping': self._mapping, 'created_by': self.hwid})
+
 
 # ----------------------------- Utilities ------------------------------------
 
@@ -462,6 +605,52 @@ def _short_hwid_hash(hwid: str) -> str:
     h = hashes.Hash(hashes.SHA256(), backend=default_backend())
     h.update(hwid.encode('utf-8'))
     return h.finalize().hex()[:32]
+
+
+def get_drive_identifier(drive: str) -> str:
+    try:
+        label, serial, _, _, _ = win32api.GetVolumeInformation(drive)
+        return f"{label or 'VOL'}-{serial}"
+    except Exception:
+        return drive.replace(':', '').replace('\\', '')
+
+
+def is_drive_allowed(drive: str) -> bool:
+    cfg = load_config()
+    drive_id = get_drive_identifier(drive)
+    return drive_id in cfg.get('allowed', {})
+
+
+def add_allowed_drive(drive: str) -> bool:
+    if not require_admin_password():
+        return False
+    cfg = load_config()
+    drive_id = get_drive_identifier(drive)
+    label = drive.rstrip('\\')
+    cfg.setdefault('allowed', {})[drive_id] = label
+    save_config(cfg)
+    print(f"Drive {drive} added to local allowlist.")
+    return True
+
+
+def list_connected_drives() -> List[str]:
+    drives = []
+    mask = win32file.GetLogicalDrives()
+    for letter in range(26):
+        if mask & (1 << letter):
+            drives.append(f"{chr(65 + letter)}:" + os.sep)
+    return drives
+
+
+def ensure_autostart():
+    try:
+        ensure_config_dir()
+        run_key = r"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, run_key, 0, winreg.KEY_SET_VALUE) as key:
+            cmd = f'"{sys.executable}" "{os.path.abspath(__file__)}" --gui'
+            winreg.SetValueEx(key, 'USBProtector', 0, winreg.REG_SZ, cmd)
+    except Exception:
+        pass
 
 
 def list_removable_drives() -> List[str]:
@@ -511,21 +700,31 @@ class USBMonitor:
         self.known = set()
         self.processors: Dict[str, DriveProcessor] = {}
         self.running = False
+        self._thread: Optional[threading.Thread] = None
 
     def start_monitor(self):
-        self.running = True
-        t = threading.Thread(target=self._loop, daemon=True)
-        t.start()
+        self.start_background()
         print("USB Protector monitor running. Press Ctrl+C to stop.")
         try:
             while True:
                 time.sleep(1)
         except KeyboardInterrupt:
             print("Stopping... cleaning up temp views...")
-            self.running = False
-            for dp in list(self.processors.values()):
-                dp.cleanup_temp()
+            self.stop()
             print("Stopped.")
+
+    def start_background(self):
+        if self.running:
+            return
+        self.running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self.running = False
+        for dp in list(self.processors.values()):
+            dp.cleanup_temp()
+        self.processors.clear()
 
     def _loop(self):
         while self.running:
@@ -533,6 +732,9 @@ class USBMonitor:
                 drives = set(list_removable_drives())
                 for d in drives - self.known:
                     print(f"Detected removable drive: {d}")
+                    if not is_drive_allowed(d):
+                        print(f"Drive {d} is not in local allowlist. Auto-decrypt disabled.")
+                        continue
                     dp = DriveProcessor(d)
                     ok, reason = dp.load_or_init()
                     if ok:
@@ -571,27 +773,124 @@ def choose_drive_interactive() -> Optional[str]:
         return None
 
 
+class SimpleGUI:
+    def __init__(self):
+        ensure_windows()
+        ensure_autostart()
+        self.monitor = USBMonitor()
+        self.root = tk.Tk()
+        self.root.title('USB Protector')
+        self.root.geometry('480x280')
+        self.root.iconify()
+        self.root.protocol('WM_DELETE_WINDOW', self.on_close)
+
+        frm = ttk.Frame(self.root, padding=10)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        self.tree = ttk.Treeview(frm, columns=('status', 'id'), show='headings')
+        self.tree.heading('status', text='Status')
+        self.tree.heading('id', text='Identifier')
+        self.tree.column('status', width=80)
+        self.tree.column('id', width=280)
+        self.tree.pack(fill=tk.BOTH, expand=True)
+
+        btn_frame = ttk.Frame(frm)
+        btn_frame.pack(fill=tk.X, pady=8)
+
+        ttk.Button(btn_frame, text='Refresh', command=self.refresh).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text='Start monitor', command=self.start_monitor).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text='Stop monitor', command=self.stop_monitor).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text='Add to allowlist (admin)', command=self.admin_allow).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text='Admin decrypt', command=self.admin_decrypt).pack(side=tk.LEFT, padx=4)
+
+        self.refresh()
+
+    def refresh(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        cfg = load_config()
+        for drive in list_connected_drives():
+            drive_id = get_drive_identifier(drive)
+            allowed = drive_id in cfg.get('allowed', {})
+            status = 'allowed' if allowed else 'blocked'
+            label = cfg.get('allowed', {}).get(drive_id, drive_id)
+            self.tree.insert('', 'end', iid=drive, values=(status, f"{drive} | {label}"))
+
+    def _selected_drive(self) -> Optional[str]:
+        sel = self.tree.selection()
+        return sel[0] if sel else None
+
+    def start_monitor(self):
+        self.monitor.start_background()
+        messagebox.showinfo('USB Protector', 'Monitor running in background (window may stay minimized).')
+
+    def stop_monitor(self):
+        self.monitor.stop()
+        messagebox.showinfo('USB Protector', 'Monitor stopped and temp views cleaned.')
+
+    def admin_allow(self):
+        d = self._selected_drive()
+        if not d:
+            messagebox.showwarning('USB Protector', 'Select a drive first.')
+            return
+        if add_allowed_drive(d):
+            self.refresh()
+
+    def admin_decrypt(self):
+        d = self._selected_drive()
+        if not d:
+            messagebox.showwarning('USB Protector', 'Select a drive first.')
+            return
+        if not require_admin_password():
+            return
+        dp = DriveProcessor(d)
+        dp.meta = load_wrapped_keys(d)
+        if dp.meta is None:
+            messagebox.showerror('USB Protector', 'Metadata missing; cannot restore.')
+            return
+        ok, msg = dp.permanent_decrypt()
+        messagebox.showinfo('USB Protector', f'Decrypt result: {ok} ({msg})')
+
+    def on_close(self):
+        self.monitor.stop()
+        self.root.destroy()
+
+    def run(self):
+        self.root.mainloop()
+
+
 def main_menu():
     ensure_windows()
+    ensure_autostart()
     while True:
         print('\n- main menu -')
-        print('1) Initialize & Encrypt (lock forever) - choose USB to encrypt')
-        print('2) Permanently Decrypt (restore) - choose USB to restore')
+        print('1) (Admin) Initialize & Encrypt (lock forever) - choose USB to encrypt')
+        print('2) (Admin) Permanently Decrypt (restore) - choose USB to restore')
         print('3) View (temporary decrypted view while running)')
-        print('4) Exit')
+        print('4) Show connected drives and allowlist status')
+        print('5) (Admin) Add connected USB to local allowlist')
+        print('6) Exit')
         choice = input('Select: ').strip()
         if choice == '1':
+            if not require_admin_password():
+                continue
             d = choose_drive_interactive()
             if not d:
                 continue
-            confirm = input(f"This WILL destructively encrypt drive {d}. Continue? (type 'YES' to proceed): ")
-            if confirm != 'YES':
+            while True:
+                confirm = input(f"This WILL destructively encrypt drive {d}. Continue? (y/n): ").strip().lower()
+                if confirm in {'y', 'n'}:
+                    break
+                print("Please press 'y' to proceed or 'n' to cancel.")
+            if confirm != 'y':
                 print('Aborted')
                 continue
             dp = DriveProcessor(d)
             ok, msg = dp.initialize_and_encrypt(make_backup=True)
             print('Result:', ok, msg)
         elif choice == '2':
+            if not require_admin_password():
+                continue
             d = choose_drive_interactive()
             if not d:
                 continue
@@ -607,6 +906,19 @@ def main_menu():
             monitor = USBMonitor()
             monitor.start_monitor()
         elif choice == '4':
+            print('Connected drives:')
+            cfg = load_config()
+            for drive in list_connected_drives():
+                allowed = 'allowed' if is_drive_allowed(drive) else 'blocked'
+                drive_id = get_drive_identifier(drive)
+                label = cfg.get('allowed', {}).get(drive_id, drive_id)
+                print(f"  {drive} -> {label} ({allowed})")
+        elif choice == '5':
+            d = choose_drive_interactive()
+            if not d:
+                continue
+            add_allowed_drive(d)
+        elif choice == '6':
             print('Exit')
             break
         else:
@@ -614,4 +926,8 @@ def main_menu():
 
 
 if __name__ == '__main__':
-    main_menu()
+    if '--gui' in sys.argv:
+        app = SimpleGUI()
+        app.run()
+    else:
+        main_menu()
