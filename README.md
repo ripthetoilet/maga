@@ -25,10 +25,18 @@ pip install cryptography pywin32
 python usb_protector.py
 ```
 
+GUI (starts minimized, creates auto-start entry on first run):
+
+```bash
+python usb_protector.py --gui
+```
+
 Choose from the interactive menu:
-- **Initialize & Encrypt**: destructively encrypts a selected removable drive (with optional zip backup).
-- **Permanently Decrypt**: restores an encrypted drive when run on an authorized PC.
-- **View**: starts a monitor that auto-decrypts files to a temp view for authorized drives while running and syncs any edits back to encrypted storage.
+- **Initialize & Encrypt** (admin): destructively encrypts a selected removable drive (with optional zip backup) after an explicit `y/n` confirmation.
+- **Permanently Decrypt** (admin): restores an encrypted drive when run on an authorized PC.
+- **View**: starts a monitor that auto-decrypts files to a temp view for allowed drives while running, automatically opens that folder when an allowed drive is inserted, and syncs any edits back to encrypted storage.
+- **Show connected drives**: prints all mounted drives with allowlist status for the current PC.
+- **Add to allowlist** (admin): marks a specific USB as allowed on this PC; other drives remain blocked from auto-decrypt.
 
 ## Deployment notes
 - Convert to a Windows service or add to Startup for auto-run.
