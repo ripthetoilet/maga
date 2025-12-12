@@ -739,7 +739,12 @@ def list_connected_drives() -> List[str]:
     mask = win32file.GetLogicalDrives()
     for letter in range(26):
         if mask & (1 << letter):
-            drives.append(f"{chr(65 + letter)}:" + os.sep)
+            drive = f"{chr(65 + letter)}:" + os.sep
+            try:
+                if win32file.GetDriveType(drive) == win32file.DRIVE_REMOVABLE:
+                    drives.append(drive)
+            except Exception:
+                pass
     return drives
 
 
@@ -879,9 +884,9 @@ def choose_drive_interactive() -> Optional[str]:
 
 def print_new_pc_help():
     print('\nЯк розшифрувати носій на новому ПК:')
-    print('  1. На авторизованому комп'"'"ютері вставте USB і в меню оберіть "Share access with this PC"')
+    print("  1. На авторизованому комп'ютері вставте USB і в меню оберіть \"Share access with this PC\"")
     print('     або кнопку GUI "Share with this PC (admin)" — це додасть ключ для поточного HWID.')
-    print('  2. Перенесіть носій на новий комп'"'"ютер. Програма автоматично розпізнає ключ,')
+    print("  2. Перенесіть носій на новий комп'ютер. Програма автоматично розпізнає ключ,")
     print('     після чого можна запустити тимчасовий перегляд або постійну розшифровку.')
     print('  3. Якщо прихована папка .usb_protect_meta була втрачена, програма відновить її')
     print('     з локальної резервної копії (з каталогу AppData) під час першої спроби роботи з носієм.')
@@ -894,8 +899,10 @@ class SimpleGUI:
         self.monitor = USBMonitor()
         self.root = tk.Tk()
         self.root.title('USB Protector')
-        self.root.geometry('480x280')
+        self.root.geometry('760x320')
         self.root.protocol('WM_DELETE_WINDOW', self.on_close)
+
+        self.section_iids = {'section_allowed', 'section_blocked'}
 
         frm = ttk.Frame(self.root, padding=10)
         frm.pack(fill=tk.BOTH, expand=True)
@@ -903,8 +910,8 @@ class SimpleGUI:
         self.tree = ttk.Treeview(frm, columns=('status', 'id'), show='headings')
         self.tree.heading('status', text='Status')
         self.tree.heading('id', text='Identifier')
-        self.tree.column('status', width=80)
-        self.tree.column('id', width=280)
+        self.tree.column('status', width=120)
+        self.tree.column('id', width=540)
         self.tree.pack(fill=tk.BOTH, expand=True)
 
         btn_frame = ttk.Frame(frm)
@@ -914,6 +921,7 @@ class SimpleGUI:
         ttk.Button(btn_frame, text='Start monitor', command=self.start_monitor).pack(side=tk.LEFT, padx=4)
         ttk.Button(btn_frame, text='Stop monitor', command=self.stop_monitor).pack(side=tk.LEFT, padx=4)
         ttk.Button(btn_frame, text='Add to allowlist (admin)', command=self.admin_allow).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text='Remove from allowlist', command=self.admin_remove).pack(side=tk.LEFT, padx=4)
         ttk.Button(btn_frame, text='Admin decrypt', command=self.admin_decrypt).pack(side=tk.LEFT, padx=4)
         ttk.Button(btn_frame, text='Share with this PC (admin)', command=self.admin_share_local).pack(side=tk.LEFT, padx=4)
 
@@ -932,11 +940,15 @@ class SimpleGUI:
             self.tree.delete(item)
         cfg = load_config()
         connected = {get_drive_identifier(d): d for d in list_connected_drives()}
+
+        self.tree.insert('', 'end', iid='section_allowed', values=('Дозволені носії', ''))
         for drive_id, label in cfg.get('allowed', {}).items():
             drive = connected.get(drive_id, '')
             status = 'allowed (connected)' if drive else 'allowed (not connected)'
             display = f"{drive or '—'} | {label}"
             self.tree.insert('', 'end', iid=drive or drive_id, values=(status, display))
+
+        self.tree.insert('', 'end', iid='section_blocked', values=('Заблоковані носії', ''))
         for drive_id, drive in connected.items():
             if drive_id in cfg.get('allowed', {}):
                 continue
@@ -945,7 +957,12 @@ class SimpleGUI:
 
     def _selected_drive(self) -> Optional[str]:
         sel = self.tree.selection()
-        return sel[0] if sel else None
+        if not sel:
+            return None
+        iid = sel[0]
+        if iid in self.section_iids:
+            return None
+        return iid
 
     def start_monitor(self):
         self.monitor.start_background()
@@ -965,6 +982,23 @@ class SimpleGUI:
             return
         if add_allowed_drive(d):
             self.refresh()
+
+    def admin_remove(self):
+        d = self._selected_drive()
+        if not d:
+            messagebox.showwarning('USB Protector', 'Select a drive to remove from allowlist.')
+            return
+        cfg = load_config()
+        drive_id = get_drive_identifier(d) if ':' in d else d
+        if drive_id not in cfg.get('allowed', {}):
+            messagebox.showinfo('USB Protector', 'Selected drive is not in the allowlist.')
+            return
+        if not require_admin_password():
+            return
+        cfg['allowed'].pop(drive_id, None)
+        save_config(cfg)
+        messagebox.showinfo('USB Protector', 'Drive removed from allowlist.')
+        self.refresh()
 
     def admin_decrypt(self):
         d = self._selected_drive()
