@@ -70,6 +70,8 @@ POLL_INTERVAL = 2
 TEMP_ROOT = os.path.join(tempfile.gettempdir(), "usb_protect_view")
 CONFIG_ROOT = os.path.join(os.getenv('APPDATA', tempfile.gettempdir()), "usb_protector")
 CONFIG_PATH = os.path.join(CONFIG_ROOT, "config.json")
+RECOVERY_ROOT = os.path.join(CONFIG_ROOT, "recovery")
+DEFAULT_ADMIN_PASSWORD = "1111"
 MAX_AUTO_DECRYPT = 300 * 1024 * 1024
 # -----------------------------------------------------------------------------
 
@@ -82,20 +84,22 @@ def ensure_windows():
 
 def ensure_config_dir():
     os.makedirs(CONFIG_ROOT, exist_ok=True)
+    os.makedirs(RECOVERY_ROOT, exist_ok=True)
 
 
 def load_config() -> dict:
     ensure_config_dir()
     if not os.path.exists(CONFIG_PATH):
-        return {"admin_hash": "", "allowed": {}}
+        return {"admin_hash": _hash_password(DEFAULT_ADMIN_PASSWORD), "admin_must_change": True, "allowed": {}}
     try:
         with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        data.setdefault("admin_hash", "")
+        data.setdefault("admin_hash", _hash_password(DEFAULT_ADMIN_PASSWORD))
+        data.setdefault("admin_must_change", True)
         data.setdefault("allowed", {})
         return data
     except Exception:
-        return {"admin_hash": "", "allowed": {}}
+        return {"admin_hash": _hash_password(DEFAULT_ADMIN_PASSWORD), "admin_must_change": True, "allowed": {}}
 
 
 def save_config(cfg: dict) -> None:
@@ -150,17 +154,25 @@ def _hash_password(pw: str) -> str:
 
 def require_admin_password(prompt: str = 'Admin password: ') -> bool:
     cfg = load_config()
-    if not cfg.get('admin_hash'):
-        print('No admin password set. Create a new one now.')
-        pw1 = getpass.getpass('New admin password: ')
-        pw2 = getpass.getpass('Repeat password: ')
-        if not pw1 or pw1 != pw2:
-            print('Passwords did not match.')
+    if cfg.get('admin_must_change'):
+        pw = getpass.getpass('Enter default admin password (1111) to set a new one: ')
+        if _hash_password(pw) != cfg['admin_hash']:
+            print('Default admin password did not match.')
             return False
-        cfg['admin_hash'] = _hash_password(pw1)
-        save_config(cfg)
-        print('Admin password set.')
-        return True
+        while True:
+            pw1 = getpass.getpass('New admin password: ')
+            pw2 = getpass.getpass('Repeat password: ')
+            if not pw1:
+                print('Password cannot be empty.')
+                continue
+            if pw1 != pw2:
+                print('Passwords did not match. Try again.')
+                continue
+            cfg['admin_hash'] = _hash_password(pw1)
+            cfg['admin_must_change'] = False
+            save_config(cfg)
+            print('Admin password changed for this installation.')
+            return True
     pw = getpass.getpass(prompt)
     if _hash_password(pw) == cfg['admin_hash']:
         return True
@@ -186,14 +198,72 @@ def meta_enc_path(root: str) -> str:
     return os.path.join(meta_dir(root), META_INFO)
 
 
+def recovery_path(root: str) -> str:
+    drive_id = get_drive_identifier(root)
+    safe = drive_id.replace(':', '_').replace('\\', '_').replace('/', '_')
+    return os.path.join(RECOVERY_ROOT, f"{safe}.json")
+
+
 def load_wrapped_keys(root: str) -> Optional[Meta]:
     p = wrapped_path(root)
     if not os.path.exists(p):
+        restored = restore_metadata_from_recovery(root)
+        if restored:
+            return restored
         return None
     try:
         with open(p, 'r', encoding='utf-8') as f:
             data = json.load(f)
         return Meta(wrapped=data.get('wrapped', {}))
+    except Exception:
+        restored = restore_metadata_from_recovery(root)
+        return restored
+
+
+def persist_recovery_snapshot(root: str, meta: Optional[Meta], payload: Optional[dict]) -> None:
+    try:
+        ensure_config_dir()
+        data: dict = {}
+        rp = recovery_path(root)
+        if os.path.exists(rp):
+            with open(rp, 'r', encoding='utf-8') as f:
+                try:
+                    data = json.load(f)
+                except Exception:
+                    data = {}
+        if meta:
+            data['wrapped'] = meta.wrapped
+        if payload is not None:
+            data['meta_payload'] = payload
+        data['drive_root'] = root
+        data['updated_at'] = time.time()
+        with open(rp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def restore_metadata_from_recovery(root: str) -> Optional[Meta]:
+    rp = recovery_path(root)
+    if not os.path.exists(rp):
+        return None
+    try:
+        with open(rp, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        wrapped = data.get('wrapped', {})
+        if not wrapped:
+            return None
+        meta = Meta(wrapped=wrapped)
+        save_wrapped_keys(root, meta)
+        master_key = None
+        for candidate in wrapped.values():
+            master_key = unwrap_master_with_hwid(candidate, get_hwid())
+            if master_key:
+                break
+        payload = data.get('meta_payload')
+        if master_key and payload:
+            save_meta_encrypted(root, master_key, payload, meta)
+        return meta
     except Exception:
         return None
 
@@ -204,6 +274,7 @@ def save_wrapped_keys(root: str, meta: Meta) -> None:
     p = wrapped_path(root)
     with open(p, 'w', encoding='utf-8') as f:
         json.dump({'wrapped': meta.wrapped}, f, indent=2, ensure_ascii=False)
+    persist_recovery_snapshot(root, meta, None)
     try:
         if win32api:
             win32api.SetFileAttributes(d, win32con.FILE_ATTRIBUTE_HIDDEN)
@@ -211,13 +282,14 @@ def save_wrapped_keys(root: str, meta: Meta) -> None:
         pass
 
 
-def save_meta_encrypted(root: str, master_key: bytes, payload: dict) -> None:
+def save_meta_encrypted(root: str, master_key: bytes, payload: dict, meta: Optional[Meta] = None) -> None:
     aes = AESGCM(master_key)
     nonce = os.urandom(12)
     data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
     ct = aes.encrypt(nonce, data, None)
     with open(meta_enc_path(root), 'wb') as f:
         f.write(nonce + ct)
+    persist_recovery_snapshot(root, meta, payload)
 
 
 def load_meta_encrypted(root: str, master_key: bytes) -> Optional[dict]:
@@ -385,6 +457,26 @@ class DriveProcessor:
                 return (True, 'unwrapped_alt')
         return (False, 'not_authorized')
 
+    def add_local_hwid_access(self) -> Tuple[bool, str]:
+        if self.meta is None:
+            self.meta = load_wrapped_keys(self.root)
+        if self.meta is None:
+            return (False, 'no_meta')
+        ok, reason = self.load_or_init()
+        if not ok:
+            return (False, reason)
+        hwid_hash = _short_hwid_hash(self.hwid)
+        if hwid_hash in self.meta.wrapped:
+            return (True, 'already_added')
+        try:
+            new_wrapped = wrap_master_for_hwid(self.master_key, self.hwid)
+            self.meta.wrapped[hwid_hash] = base64.b64encode(new_wrapped).decode('utf-8')
+            save_wrapped_keys(self.root, self.meta)
+            persist_recovery_snapshot(self.root, self.meta, None)
+            return (True, 'added')
+        except Exception as e:
+            return (False, str(e))
+
     def initialize_and_encrypt(self, make_backup: bool = True) -> Tuple[bool, str]:
         try:
             if make_backup:
@@ -415,7 +507,7 @@ class DriveProcessor:
                         os.rmdir(dirpath)
                 except Exception:
                     pass
-            save_meta_encrypted(self.root, self.master_key, {'mapping': mapping, 'created_by': self.hwid})
+            save_meta_encrypted(self.root, self.master_key, {'mapping': mapping, 'created_by': self.hwid}, self.meta)
             return (True, 'encrypted')
         except Exception as e:
             return (False, str(e))
@@ -584,7 +676,7 @@ class DriveProcessor:
         enc_path = os.path.join(self.root, token)
         with open(enc_path, 'wb') as f:
             f.write(enc)
-        save_meta_encrypted(self.root, self.master_key, {'mapping': self._mapping, 'created_by': self.hwid})
+        save_meta_encrypted(self.root, self.master_key, {'mapping': self._mapping, 'created_by': self.hwid}, self.meta)
 
     def _handle_deletion(self, rel: str):
         token = self._reverse_mapping.get(rel)
@@ -596,7 +688,7 @@ class DriveProcessor:
             pass
         self._reverse_mapping.pop(rel, None)
         self._mapping.pop(token, None)
-        save_meta_encrypted(self.root, self.master_key, {'mapping': self._mapping, 'created_by': self.hwid})
+        save_meta_encrypted(self.root, self.master_key, {'mapping': self._mapping, 'created_by': self.hwid}, self.meta)
 
 
 # ----------------------------- Utilities ------------------------------------
@@ -647,7 +739,12 @@ def list_connected_drives() -> List[str]:
     mask = win32file.GetLogicalDrives()
     for letter in range(26):
         if mask & (1 << letter):
-            drives.append(f"{chr(65 + letter)}:" + os.sep)
+            drive = f"{chr(65 + letter)}:" + os.sep
+            try:
+                if win32file.GetDriveType(drive) == win32file.DRIVE_REMOVABLE:
+                    drives.append(drive)
+            except Exception:
+                pass
     return drives
 
 
@@ -656,7 +753,7 @@ def ensure_autostart():
         ensure_config_dir()
         run_key = r"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, run_key, 0, winreg.KEY_SET_VALUE) as key:
-            cmd = f'"{sys.executable}" "{os.path.abspath(__file__)}" --gui'
+            cmd = f'"{sys.executable}" "{os.path.abspath(__file__)}"'
             winreg.SetValueEx(key, 'USBProtector', 0, winreg.REG_SZ, cmd)
     except Exception:
         pass
@@ -785,6 +882,16 @@ def choose_drive_interactive() -> Optional[str]:
         return None
 
 
+def print_new_pc_help():
+    print('\nЯк розшифрувати носій на новому ПК:')
+    print("  1. На авторизованому комп'ютері вставте USB і в меню оберіть \"Share access with this PC\"")
+    print('     або кнопку GUI "Share with this PC (admin)" — це додасть ключ для поточного HWID.')
+    print("  2. Перенесіть носій на новий комп'ютер. Програма автоматично розпізнає ключ,")
+    print('     після чого можна запустити тимчасовий перегляд або постійну розшифровку.')
+    print('  3. Якщо прихована папка .usb_protect_meta була втрачена, програма відновить її')
+    print('     з локальної резервної копії (з каталогу AppData) під час першої спроби роботи з носієм.')
+
+
 class SimpleGUI:
     def __init__(self):
         ensure_windows()
@@ -792,9 +899,10 @@ class SimpleGUI:
         self.monitor = USBMonitor()
         self.root = tk.Tk()
         self.root.title('USB Protector')
-        self.root.geometry('480x280')
-        self.root.iconify()
+        self.root.geometry('760x320')
         self.root.protocol('WM_DELETE_WINDOW', self.on_close)
+
+        self.section_iids = {'section_allowed', 'section_blocked'}
 
         frm = ttk.Frame(self.root, padding=10)
         frm.pack(fill=tk.BOTH, expand=True)
@@ -802,8 +910,8 @@ class SimpleGUI:
         self.tree = ttk.Treeview(frm, columns=('status', 'id'), show='headings')
         self.tree.heading('status', text='Status')
         self.tree.heading('id', text='Identifier')
-        self.tree.column('status', width=80)
-        self.tree.column('id', width=280)
+        self.tree.column('status', width=120)
+        self.tree.column('id', width=540)
         self.tree.pack(fill=tk.BOTH, expand=True)
 
         btn_frame = ttk.Frame(frm)
@@ -813,7 +921,16 @@ class SimpleGUI:
         ttk.Button(btn_frame, text='Start monitor', command=self.start_monitor).pack(side=tk.LEFT, padx=4)
         ttk.Button(btn_frame, text='Stop monitor', command=self.stop_monitor).pack(side=tk.LEFT, padx=4)
         ttk.Button(btn_frame, text='Add to allowlist (admin)', command=self.admin_allow).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text='Remove from allowlist', command=self.admin_remove).pack(side=tk.LEFT, padx=4)
         ttk.Button(btn_frame, text='Admin decrypt', command=self.admin_decrypt).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text='Share with this PC (admin)', command=self.admin_share_local).pack(side=tk.LEFT, padx=4)
+
+        help_text = (
+            "Пристрій можна розблокувати на новому ПК, якщо на носії є ключ для цього HWID."
+            " Використайте кнопку 'Share with this PC (admin)' на авторизованому комп'ютері"
+            " або опцію меню для копіювання ключа на інший ПК."
+        )
+        ttk.Label(frm, text=help_text, wraplength=440, foreground='gray').pack(fill=tk.X, pady=6)
 
         self.refresh()
         self.monitor.start_background()
@@ -823,11 +940,15 @@ class SimpleGUI:
             self.tree.delete(item)
         cfg = load_config()
         connected = {get_drive_identifier(d): d for d in list_connected_drives()}
+
+        self.tree.insert('', 'end', iid='section_allowed', values=('Дозволені носії', ''))
         for drive_id, label in cfg.get('allowed', {}).items():
             drive = connected.get(drive_id, '')
             status = 'allowed (connected)' if drive else 'allowed (not connected)'
             display = f"{drive or '—'} | {label}"
             self.tree.insert('', 'end', iid=drive or drive_id, values=(status, display))
+
+        self.tree.insert('', 'end', iid='section_blocked', values=('Заблоковані носії', ''))
         for drive_id, drive in connected.items():
             if drive_id in cfg.get('allowed', {}):
                 continue
@@ -836,7 +957,12 @@ class SimpleGUI:
 
     def _selected_drive(self) -> Optional[str]:
         sel = self.tree.selection()
-        return sel[0] if sel else None
+        if not sel:
+            return None
+        iid = sel[0]
+        if iid in self.section_iids:
+            return None
+        return iid
 
     def start_monitor(self):
         self.monitor.start_background()
@@ -857,6 +983,23 @@ class SimpleGUI:
         if add_allowed_drive(d):
             self.refresh()
 
+    def admin_remove(self):
+        d = self._selected_drive()
+        if not d:
+            messagebox.showwarning('USB Protector', 'Select a drive to remove from allowlist.')
+            return
+        cfg = load_config()
+        drive_id = get_drive_identifier(d) if ':' in d else d
+        if drive_id not in cfg.get('allowed', {}):
+            messagebox.showinfo('USB Protector', 'Selected drive is not in the allowlist.')
+            return
+        if not require_admin_password():
+            return
+        cfg['allowed'].pop(drive_id, None)
+        save_config(cfg)
+        messagebox.showinfo('USB Protector', 'Drive removed from allowlist.')
+        self.refresh()
+
     def admin_decrypt(self):
         d = self._selected_drive()
         if not d:
@@ -872,9 +1015,22 @@ class SimpleGUI:
         ok, msg = dp.permanent_decrypt()
         messagebox.showinfo('USB Protector', f'Decrypt result: {ok} ({msg})')
 
+    def admin_share_local(self):
+        d = self._selected_drive()
+        if not d:
+            messagebox.showwarning('USB Protector', 'Select a drive first.')
+            return
+        if ':' not in d:
+            messagebox.showwarning('USB Protector', 'Insert the USB drive before sharing access.')
+            return
+        if not require_admin_password():
+            return
+        dp = DriveProcessor(d)
+        ok, msg = dp.add_local_hwid_access()
+        messagebox.showinfo('USB Protector', f'Add this PC result: {ok} ({msg})')
+
     def on_close(self):
-        self.monitor.stop()
-        self.root.destroy()
+        self.root.iconify()
 
     def run(self):
         self.root.mainloop()
@@ -893,7 +1049,9 @@ def main_menu():
         print('4) Show connected drives and allowlist status')
         print('5) Show allowed USB list for this PC')
         print('6) (Admin) Add connected USB to local allowlist')
-        print('7) Exit')
+        print('7) (Admin) Share access with this PC for an encrypted USB')
+        print('8) Help: how to decrypt on a new PC')
+        print('9) Exit')
         choice = input('Select: ').strip()
         if choice == '1':
             if not require_admin_password():
@@ -952,6 +1110,17 @@ def main_menu():
                 continue
             add_allowed_drive(d)
         elif choice == '7':
+            if not require_admin_password():
+                continue
+            d = choose_drive_interactive()
+            if not d:
+                continue
+            dp = DriveProcessor(d)
+            ok, msg = dp.add_local_hwid_access()
+            print('Result:', ok, msg)
+        elif choice == '8':
+            print_new_pc_help()
+        elif choice == '9':
             print('Exit')
             monitor.stop()
             break
@@ -960,8 +1129,8 @@ def main_menu():
 
 
 if __name__ == '__main__':
-    if '--gui' in sys.argv:
+    if '--cli' in sys.argv:
+        main_menu()
+    else:
         app = SimpleGUI()
         app.run()
-    else:
-        main_menu()
