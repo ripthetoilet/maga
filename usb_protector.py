@@ -88,7 +88,7 @@ CONFIG_PATH = os.path.join(CONFIG_ROOT, "config.json")
 RECOVERY_ROOT = os.path.join(CONFIG_ROOT, "recovery")
 PRIVATE_KEY_PATH = os.path.join(CONFIG_ROOT, "private_key.pem.enc")  # Зашифрований ключ
 PUBLIC_KEY_FILENAME = "public_key.pem"
-DEFAULT_ADMIN_PASSWORD = "1111"
+DEFAULT_ADMIN_HASH = "0ffe1abd1a08215353c233d6e009613e95eec4253832a761af28ff37ac5a150c"
 MAX_AUTO_DECRYPT = 300 * 1024 * 1024
 MAX_PASSWORD_ATTEMPTS = 5
 LOCKOUT_SECONDS = 30
@@ -118,18 +118,18 @@ def ensure_config_dir():
 def load_config() -> dict:
     ensure_config_dir()
     if not os.path.exists(CONFIG_PATH):
-        return {"admin_hash": _hash_password(DEFAULT_ADMIN_PASSWORD), "admin_must_change": True, "allowed": {}}
+        return {"admin_hash": DEFAULT_ADMIN_HASH, "admin_must_change": True, "allowed": {}}
     try:
         with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
             data = json.load(f)
         # Не встановлюємо admin_must_change = True, якщо він вже був змінений
         if "admin_must_change" not in data:
             data["admin_must_change"] = True
-        data.setdefault("admin_hash", _hash_password(DEFAULT_ADMIN_PASSWORD))
+        data.setdefault("admin_hash", DEFAULT_ADMIN_HASH)
         data.setdefault("allowed", {})
         return data
     except Exception:
-        return {"admin_hash": _hash_password(DEFAULT_ADMIN_PASSWORD), "admin_must_change": True, "allowed": {}}
+        return {"admin_hash": DEFAULT_ADMIN_HASH, "admin_must_change": True, "allowed": {}}
 
 
 def save_config(cfg: dict) -> None:
@@ -205,7 +205,7 @@ def require_admin_password(prompt: str = 'Admin password: ', password_provider=N
     cfg = load_config()
     # Перевіряємо чи потрібно змінити пароль тільки якщо він ще не був змінений
     if cfg.get('admin_must_change'):
-        pw = _get_password('Введіть пароль адміністратора за замовчуванням (1111) для встановлення нового: ', password_provider)
+        pw = _get_password('Введіть поточний пароль адміністратора для встановлення нового: ', password_provider)
         if _hash_password(pw) != cfg['admin_hash']:
             print('Пароль за замовчуванням не співпадає.')
             _PASSWORD_STATE["count"] += 1
@@ -1369,14 +1369,6 @@ class SimpleGUI:
         if iid in self.section_iids:
             return None
         return iid
-
-    def start_monitor(self):
-        self.monitor.start_background()
-        messagebox.showinfo('Захист USB', 'Моніторинг запущено у фоновому режимі (вікно може бути згорнуто).')
-
-    def stop_monitor(self):
-        self.monitor.stop()
-        messagebox.showinfo('Захист USB', 'Моніторинг зупинено та тимчасові перегляди очищено.')
 
     def admin_allow(self):
         d = self._selected_drive()
