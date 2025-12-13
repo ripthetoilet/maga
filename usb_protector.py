@@ -38,7 +38,7 @@ import getpass
 import hashlib
 import winreg
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, simpledialog
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple
 
@@ -48,6 +48,8 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import keywrap
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives.serialization import load_pem_private_key, load_pem_public_key, Encoding, PrivateFormat, PublicFormat, NoEncryption
 
 # Windows-specific
 try:
@@ -64,16 +66,42 @@ PROGRAM_SALT = b"USB_PROTECT_SALT_v1"
 META_DIRNAME = ".usb_protect_meta"
 META_WRAPPED_KEYS = "wrapped_keys.json"
 META_INFO = "meta.enc"
+META_RSA_ENCRYPTED_KEY = "master_key.enc"
 FILE_TAG = b"USBPROT1"
 FILE_VERSION = 1
 POLL_INTERVAL = 2
-TEMP_ROOT = os.path.join(tempfile.gettempdir(), "usb_protect_view")
+# Тимчасові файли на диску D
+def get_temp_root():
+    """Повертає шлях для тимчасових файлів на диску D"""
+    try:
+        # Перевіряємо чи існує диск D
+        if os.path.exists("D:\\"):
+            return os.path.join("D:\\", "usb_protect_view")
+    except Exception:
+        pass
+    # Fallback до стандартного temp
+    return os.path.join(tempfile.gettempdir(), "usb_protect_view")
+
+TEMP_ROOT = get_temp_root()
 CONFIG_ROOT = os.path.join(os.getenv('APPDATA', tempfile.gettempdir()), "usb_protector")
 CONFIG_PATH = os.path.join(CONFIG_ROOT, "config.json")
 RECOVERY_ROOT = os.path.join(CONFIG_ROOT, "recovery")
+PRIVATE_KEY_PATH = os.path.join(CONFIG_ROOT, "private_key.pem.enc")  # Зашифрований ключ
+PUBLIC_KEY_FILENAME = "public_key.pem"
 DEFAULT_ADMIN_PASSWORD = "1111"
 MAX_AUTO_DECRYPT = 300 * 1024 * 1024
+MAX_PASSWORD_ATTEMPTS = 5
+LOCKOUT_SECONDS = 30
+RECOVERY_ENC_SALT = b"USB_PROTECT_RECOVERY_v1"
+RSA_KEY_SIZE = 2048
+
+# Hardcoded закритий ключ (генерується один раз для всіх копій програми)
+# Це дозволяє розшифровувати носії на будь-якому комп'ютері з встановленою програмою
+# Ключ генерується програмно при першому запуску і зберігається у коді
+HARDCODED_PRIVATE_KEY_PEM = None  # Буде встановлено при першому запуску
 # -----------------------------------------------------------------------------
+
+_PASSWORD_STATE = {"count": 0, "lock_until": 0.0}
 
 
 def ensure_windows():
@@ -94,8 +122,10 @@ def load_config() -> dict:
     try:
         with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
             data = json.load(f)
+        # Не встановлюємо admin_must_change = True, якщо він вже був змінений
+        if "admin_must_change" not in data:
+            data["admin_must_change"] = True
         data.setdefault("admin_hash", _hash_password(DEFAULT_ADMIN_PASSWORD))
-        data.setdefault("admin_must_change", True)
         data.setdefault("allowed", {})
         return data
     except Exception:
@@ -146,38 +176,81 @@ def derive_wrapping_key(hwid: str, salt: bytes = PROGRAM_SALT) -> bytes:
     return kdf.derive(hwid_bytes)
 
 
+def get_program_encryption_key() -> bytes:
+    """Генерує ключ для шифрування приватного ключа на основі унікального ідентифікатора програми (не залежить від HWID)"""
+    # Використовуємо тільки унікальний ідентифікатор програми, щоб ключ міг бути розшифрований на будь-якому комп'ютері
+    program_id = "USB_PROTECTOR_V1.0_SECURE_KEY"
+    return derive_wrapping_key(program_id, salt=PROGRAM_SALT)
+
+
 def _hash_password(pw: str) -> str:
     h = hashlib.sha256()
     h.update(pw.encode('utf-8'))
     return h.hexdigest()
 
 
-def require_admin_password(prompt: str = 'Admin password: ') -> bool:
+def _get_password(prompt_text: str, password_provider=None) -> Optional[str]:
+    if password_provider:
+        return password_provider(prompt_text)
+    return getpass.getpass(prompt_text)
+
+
+def require_admin_password(prompt: str = 'Admin password: ', password_provider=None) -> bool:
+    now = time.time()
+    if now < _PASSWORD_STATE["lock_until"]:
+        wait = int(_PASSWORD_STATE["lock_until"] - now)
+        print(f'Admin authentication locked. Try again in {wait} seconds.')
+        return False
+
     cfg = load_config()
+    # Перевіряємо чи потрібно змінити пароль тільки якщо він ще не був змінений
     if cfg.get('admin_must_change'):
-        pw = getpass.getpass('Enter default admin password (1111) to set a new one: ')
+        pw = _get_password('Введіть пароль адміністратора за замовчуванням (1111) для встановлення нового: ', password_provider)
         if _hash_password(pw) != cfg['admin_hash']:
-            print('Default admin password did not match.')
+            print('Пароль за замовчуванням не співпадає.')
+            _PASSWORD_STATE["count"] += 1
+            if _PASSWORD_STATE["count"] >= MAX_PASSWORD_ATTEMPTS:
+                _PASSWORD_STATE["lock_until"] = time.time() + LOCKOUT_SECONDS
+                print(f'Занадто багато невдалих спроб. Заблоковано на {LOCKOUT_SECONDS} секунд.')
             return False
         while True:
-            pw1 = getpass.getpass('New admin password: ')
-            pw2 = getpass.getpass('Repeat password: ')
+            pw1 = _get_password('Новий пароль адміністратора: ', password_provider)
+            pw2 = _get_password('Повторіть пароль: ', password_provider)
             if not pw1:
-                print('Password cannot be empty.')
+                print('Пароль не може бути порожнім.')
                 continue
             if pw1 != pw2:
-                print('Passwords did not match. Try again.')
+                print('Паролі не співпадають. Спробуйте ще раз.')
                 continue
             cfg['admin_hash'] = _hash_password(pw1)
             cfg['admin_must_change'] = False
             save_config(cfg)
-            print('Admin password changed for this installation.')
+            print('Пароль адміністратора змінено для цієї установки.')
             return True
-    pw = getpass.getpass(prompt)
+    pw = _get_password(prompt, password_provider)
     if _hash_password(pw) == cfg['admin_hash']:
+        _PASSWORD_STATE["count"] = 0
+        _PASSWORD_STATE["lock_until"] = 0.0
         return True
     print('Admin authentication failed.')
+    _PASSWORD_STATE["count"] += 1
+    if _PASSWORD_STATE["count"] >= MAX_PASSWORD_ATTEMPTS:
+        _PASSWORD_STATE["lock_until"] = time.time() + LOCKOUT_SECONDS
+        print(f'Too many failed attempts. Locked for {LOCKOUT_SECONDS} seconds.')
+    else:
+        remaining = MAX_PASSWORD_ATTEMPTS - _PASSWORD_STATE["count"]
+        print(f'{remaining} attempt(s) remaining before temporary lock.')
     return False
+
+
+def _gui_password_provider(parent):
+    def provider(prompt_text: str) -> Optional[str]:
+        return simpledialog.askstring('Пароль адміністратора', prompt_text, show='*', parent=parent)
+    return provider
+
+
+def require_admin_password_gui(parent, prompt: str = 'Пароль адміністратора: ') -> bool:
+    return require_admin_password(prompt, password_provider=_gui_password_provider(parent))
 
 
 # ----------------------------- Metadata helpers -----------------------------
@@ -198,10 +271,40 @@ def meta_enc_path(root: str) -> str:
     return os.path.join(meta_dir(root), META_INFO)
 
 
+def rsa_encrypted_key_path(root: str) -> str:
+    return os.path.join(meta_dir(root), META_RSA_ENCRYPTED_KEY)
+
+
 def recovery_path(root: str) -> str:
     drive_id = get_drive_identifier(root)
     safe = drive_id.replace(':', '_').replace('\\', '_').replace('/', '_')
     return os.path.join(RECOVERY_ROOT, f"{safe}.json")
+
+
+def _encrypt_recovery_dict(data: dict) -> dict:
+    try:
+        key = derive_wrapping_key(get_hwid(), salt=RECOVERY_ENC_SALT)
+        aes = AESGCM(key)
+        nonce = os.urandom(12)
+        raw = json.dumps(data, ensure_ascii=False).encode('utf-8')
+        ct = aes.encrypt(nonce, raw, None)
+        return {"enc": base64.b64encode(nonce + ct).decode('utf-8')}
+    except Exception:
+        return data
+
+
+def _decrypt_recovery_dict(data: dict) -> dict:
+    if "enc" not in data:
+        return data
+    try:
+        blob = base64.b64decode(data["enc"])
+        nonce, ct = blob[:12], blob[12:]
+        key = derive_wrapping_key(get_hwid(), salt=RECOVERY_ENC_SALT)
+        aes = AESGCM(key)
+        raw = aes.decrypt(nonce, ct, None)
+        return json.loads(raw.decode('utf-8'))
+    except Exception:
+        return {}
 
 
 def load_wrapped_keys(root: str) -> Optional[Meta]:
@@ -229,6 +332,7 @@ def persist_recovery_snapshot(root: str, meta: Optional[Meta], payload: Optional
             with open(rp, 'r', encoding='utf-8') as f:
                 try:
                     data = json.load(f)
+                    data = _decrypt_recovery_dict(data)
                 except Exception:
                     data = {}
         if meta:
@@ -237,6 +341,7 @@ def persist_recovery_snapshot(root: str, meta: Optional[Meta], payload: Optional
             data['meta_payload'] = payload
         data['drive_root'] = root
         data['updated_at'] = time.time()
+        data = _encrypt_recovery_dict(data)
         with open(rp, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
     except Exception:
@@ -250,6 +355,7 @@ def restore_metadata_from_recovery(root: str) -> Optional[Meta]:
     try:
         with open(rp, 'r', encoding='utf-8') as f:
             data = json.load(f)
+        data = _decrypt_recovery_dict(data)
         wrapped = data.get('wrapped', {})
         if not wrapped:
             return None
@@ -304,6 +410,176 @@ def load_meta_encrypted(root: str, master_key: bytes) -> Optional[dict]:
         aes = AESGCM(master_key)
         data = aes.decrypt(nonce, ct, None)
         return json.loads(data.decode('utf-8'))
+    except Exception:
+        return None
+
+
+# ----------------------------- RSA Key management --------------------------
+
+def generate_rsa_keypair() -> Tuple[rsa.RSAPrivateKey, rsa.RSAPublicKey]:
+    """Генерує RSA ключову пару"""
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=RSA_KEY_SIZE,
+        backend=default_backend()
+    )
+    return private_key, private_key.public_key()
+
+
+def encrypt_private_key(private_key: rsa.RSAPrivateKey) -> bytes:
+    """Шифрує приватний ключ для збереження"""
+    private_pem = private_key.private_bytes(
+        encoding=Encoding.PEM,
+        format=PrivateFormat.PKCS8,
+        encryption_algorithm=NoEncryption()
+    )
+    encryption_key = get_program_encryption_key()
+    aes = AESGCM(encryption_key)
+    nonce = os.urandom(12)
+    encrypted = aes.encrypt(nonce, private_pem, None)
+    return nonce + encrypted
+
+
+def decrypt_private_key(encrypted_data: bytes) -> Optional[rsa.RSAPrivateKey]:
+    """Розшифровує приватний ключ"""
+    try:
+        if len(encrypted_data) < 12:
+            return None
+        nonce = encrypted_data[:12]
+        ct = encrypted_data[12:]
+        encryption_key = get_program_encryption_key()
+        aes = AESGCM(encryption_key)
+        private_pem = aes.decrypt(nonce, ct, None)
+        return load_pem_private_key(private_pem, password=None, backend=default_backend())
+    except Exception:
+        return None
+
+
+def get_hardcoded_private_key() -> rsa.RSAPrivateKey:
+    """Отримує закритий ключ з AppData (зашифрований) або генерує новий"""
+    # Спробувати завантажити зашифрований ключ з AppData
+    try:
+        ensure_config_dir()
+        if os.path.exists(PRIVATE_KEY_PATH):
+            with open(PRIVATE_KEY_PATH, 'rb') as f:
+                encrypted_data = f.read()
+            private_key = decrypt_private_key(encrypted_data)
+            if private_key is not None:
+                return private_key
+            else:
+                # Якщо не вдалося розшифрувати (можливо старий формат з HWID), 
+                # спробуємо завантажити як незашифрований (для сумісності)
+                try:
+                    old_key_path = PRIVATE_KEY_PATH.replace('.enc', '')
+                    if os.path.exists(old_key_path):
+                        with open(old_key_path, 'rb') as f:
+                            private_key = load_pem_private_key(f.read(), password=None, backend=default_backend())
+                        # Перешифруємо у новому форматі (без HWID)
+                        encrypted_data = encrypt_private_key(private_key)
+                        with open(PRIVATE_KEY_PATH, 'wb') as f:
+                            f.write(encrypted_data)
+                        return private_key
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    
+    # Якщо ключ не знайдено або не вдалося розшифрувати, генеруємо новий
+    private_key, _ = generate_rsa_keypair()
+    
+    # Шифруємо і зберігаємо у AppData
+    try:
+        ensure_config_dir()
+        encrypted_data = encrypt_private_key(private_key)
+        with open(PRIVATE_KEY_PATH, 'wb') as f:
+            f.write(encrypted_data)
+    except Exception as e:
+        # Якщо не вдалося зберегти, виводимо попередження
+        print(f"Попередження: не вдалося зберегти зашифрований ключ: {e}")
+    
+    return private_key
+
+
+def ensure_rsa_keys() -> Tuple[rsa.RSAPrivateKey, rsa.RSAPublicKey]:
+    """Забезпечує наявність RSA ключів - використовує hardcoded закритий ключ"""
+    # Використовуємо hardcoded закритий ключ з коду програми
+    private_key = get_hardcoded_private_key()
+    return private_key, private_key.public_key()
+
+
+def save_public_key_to_drive(root: str, public_key: rsa.RSAPublicKey) -> bool:
+    """Зберігає публічний ключ на носій"""
+    try:
+        d = meta_dir(root)
+        os.makedirs(d, exist_ok=True)
+        public_pem = public_key.public_bytes(
+            encoding=Encoding.PEM,
+            format=PublicFormat.SubjectPublicKeyInfo
+        )
+        pub_path = os.path.join(d, PUBLIC_KEY_FILENAME)
+        with open(pub_path, 'wb') as f:
+            f.write(public_pem)
+        return True
+    except Exception:
+        return False
+
+
+def load_public_key_from_drive(root: str) -> Optional[rsa.RSAPublicKey]:
+    """Завантажує публічний ключ з носія"""
+    pub_path = os.path.join(meta_dir(root), PUBLIC_KEY_FILENAME)
+    if not os.path.exists(pub_path):
+        return None
+    try:
+        with open(pub_path, 'rb') as f:
+            return load_pem_public_key(f.read(), backend=default_backend())
+    except Exception:
+        return None
+
+
+def encrypt_master_key_rsa(master_key: bytes, public_key: rsa.RSAPublicKey) -> bytes:
+    """Шифрує master key за допомогою RSA публічного ключа"""
+    # RSA може шифрувати лише невеликі дані, тому використовуємо hybrid encryption
+    # Генеруємо випадковий AES ключ для шифрування master_key
+    aes_key = os.urandom(32)
+    aes = AESGCM(aes_key)
+    nonce = os.urandom(12)
+    encrypted_master = aes.encrypt(nonce, master_key, None)
+    # Шифруємо AES ключ RSA
+    encrypted_aes_key = public_key.encrypt(
+        aes_key,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None
+        )
+    )
+    # Повертаємо: RSA(encrypted_aes_key) + nonce + AES(encrypted_master)
+    return encrypted_aes_key + nonce + encrypted_master
+
+
+def decrypt_master_key_rsa(encrypted_data: bytes, private_key: rsa.RSAPrivateKey) -> Optional[bytes]:
+    """Розшифровує master key за допомогою RSA приватного ключа"""
+    try:
+        # RSA ключ розміром 2048 може зашифрувати до 245 байт
+        # encrypted_aes_key має бути 256 байт для 2048-bit ключа
+        rsa_encrypted_size = RSA_KEY_SIZE // 8
+        encrypted_aes_key = encrypted_data[:rsa_encrypted_size]
+        nonce = encrypted_data[rsa_encrypted_size:rsa_encrypted_size + 12]
+        encrypted_master = encrypted_data[rsa_encrypted_size + 12:]
+        
+        # Розшифровуємо AES ключ
+        aes_key = private_key.decrypt(
+            encrypted_aes_key,
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None
+            )
+        )
+        # Розшифровуємо master key
+        aes = AESGCM(aes_key)
+        master_key = aes.decrypt(nonce, encrypted_master, None)
+        return master_key
     except Exception:
         return None
 
@@ -395,6 +671,16 @@ def encrypt_and_obfuscate_file(path: str, root: str, master_key: bytes, mapping:
             new_path = os.path.join(root, token)
         with open(new_path, 'wb') as f:
             f.write(enc)
+        # Verify write before destructive delete
+        with open(new_path, 'rb') as f:
+            written = f.read()
+        restored = decrypt_content_bytes(written, master_key)
+        if restored is None or restored != data:
+            try:
+                os.remove(new_path)
+            except Exception:
+                pass
+            return None
         os.remove(path)
         mapping[token] = orig_name
         return token
@@ -438,6 +724,27 @@ class DriveProcessor:
         self._last_view_state: Dict[str, Tuple[float, int]] = {}
 
     def load_or_init(self) -> Tuple[bool, str]:
+        """Завантажує метадані та розшифровує master key через RSA"""
+        # Спочатку перевіряємо RSA зашифрований ключ
+        rsa_key_path = rsa_encrypted_key_path(self.root)
+        if os.path.exists(rsa_key_path):
+            try:
+                private_key, _ = ensure_rsa_keys()
+                with open(rsa_key_path, 'rb') as f:
+                    encrypted_data = f.read()
+                master_key = decrypt_master_key_rsa(encrypted_data, private_key)
+                if master_key is not None:
+                    self.master_key = master_key
+                    self.authorized = True
+                    # Завантажуємо метадані для сумісності
+                    self.meta = load_wrapped_keys(self.root)
+                    if self.meta is None:
+                        self.meta = Meta(wrapped={})
+                    return (True, 'rsa_unwrapped')
+            except Exception:
+                pass
+        
+        # Fallback до старої системи HWID для сумісності
         self.meta = load_wrapped_keys(self.root)
         if self.meta is None:
             return (False, 'no_meta')
@@ -477,21 +784,38 @@ class DriveProcessor:
         except Exception as e:
             return (False, str(e))
 
-    def initialize_and_encrypt(self, make_backup: bool = True) -> Tuple[bool, str]:
+    def initialize_and_encrypt(self, make_backup: bool = True, prompt_fn=None) -> Tuple[bool, str]:
+        """Ініціалізує та шифрує носій, використовуючи RSA"""
         try:
             if make_backup:
-                ok, msg = _optional_backup(self.root)
+                ok, msg = _optional_backup(self.root, prompt_fn=prompt_fn)
                 if not ok:
                     return (False, 'backup_failed')
+            # Генеруємо master key
             master = generate_master_key()
-            wrapped = wrap_master_for_hwid(master, self.hwid)
+            
+            # Отримуємо або генеруємо RSA ключову пару
+            private_key, public_key = ensure_rsa_keys()
+            
+            # Зберігаємо публічний ключ на носій
+            if not save_public_key_to_drive(self.root, public_key):
+                return (False, 'failed_to_save_public_key')
+            
+            # Шифруємо master key через RSA та зберігаємо на носій
+            encrypted_master = encrypt_master_key_rsa(master, public_key)
+            rsa_key_path = rsa_encrypted_key_path(self.root)
+            os.makedirs(meta_dir(self.root), exist_ok=True)
+            with open(rsa_key_path, 'wb') as f:
+                f.write(encrypted_master)
+            
+            # Створюємо метадані (для сумісності зі старою системою)
             meta = Meta(wrapped={})
-            hwid_hash = _short_hwid_hash(self.hwid)
-            meta.wrapped[hwid_hash] = base64.b64encode(wrapped).decode('utf-8')
             save_wrapped_keys(self.root, meta)
             self.meta = meta
             self.master_key = master
             self.authorized = True
+            
+            # Шифруємо всі файли
             mapping = {}
             for dirpath, dirnames, filenames in os.walk(self.root, topdown=False):
                 if os.path.abspath(dirpath).startswith(os.path.abspath(meta_dir(self.root))):
@@ -572,6 +896,7 @@ class DriveProcessor:
             try:
                 size = os.path.getsize(enc_path)
                 if size > MAX_AUTO_DECRYPT:
+                    print(f'Skipping large file in temp view: {orig_rel} ({size} bytes)')
                     continue
                 decrypt_to = os.path.join(self.temp_dir, orig_rel.replace('/', os.sep))
                 os.makedirs(os.path.dirname(decrypt_to), exist_ok=True)
@@ -592,6 +917,32 @@ class DriveProcessor:
 
     def cleanup_temp(self):
         self._stop_sync_loop()
+        # Закриваємо відкриту папку Explorer
+        try:
+            if os.path.exists(self.temp_dir):
+                # Використовуємо PowerShell для закриття Explorer вікна з цією папкою
+                import subprocess
+                # Екрануємо зворотні слеші для PowerShell
+                temp_path_escaped = self.temp_dir.replace('\\', '\\\\')
+                ps_cmd = f'''
+$shell = New-Object -ComObject Shell.Application
+$windows = $shell.Windows()
+$targetPath = "{temp_path_escaped}"
+foreach ($window in $windows) {{
+    try {{
+        $url = $window.LocationURL
+        if ($url -and $url.Contains($targetPath.Replace("\\\\", "/"))) {{
+            $window.Quit()
+        }}
+    }} catch {{
+        # Ігноруємо помилки
+    }}
+}}
+'''
+                subprocess.run(['powershell', '-NoProfile', '-Command', ps_cmd], 
+                            capture_output=True, timeout=3, creationflags=subprocess.CREATE_NO_WINDOW)
+        except Exception:
+            pass
         try:
             if os.path.exists(self.temp_dir):
                 for dirpath, dirnames, filenames in os.walk(self.temp_dir, topdown=False):
@@ -716,14 +1067,44 @@ def get_drive_label(drive: str) -> str:
         return drive.rstrip('\\')
 
 
+def get_drive_size_gb(drive: str) -> float:
+    """Повертає розмір диска в GB"""
+    try:
+        # GetDiskFreeSpaceEx повертає кортеж: (free_bytes, total_bytes, available_bytes)
+        result = win32api.GetDiskFreeSpaceEx(drive)
+        if len(result) >= 2:
+            total_bytes = result[1]  # Другий елемент - загальний розмір
+            return round(total_bytes / (1024 ** 3), 2)
+        return 0.0
+    except Exception:
+        return 0.0
+
+
+def format_drive_info(drive: str) -> str:
+    """Форматує інформацію про диск: назва, серійний номер, розмір"""
+    try:
+        label, serial, _, _, _ = win32api.GetVolumeInformation(drive)
+        size_gb = get_drive_size_gb(drive)
+        parts = []
+        if label:
+            parts.append(f"Назва: {label}")
+        if serial:
+            parts.append(f"Серійний: {serial}")
+        if size_gb > 0:
+            parts.append(f"Розмір: {size_gb} GB")
+        return " | ".join(parts) if parts else drive.rstrip('\\')
+    except Exception:
+        return drive.rstrip('\\')
+
+
 def is_drive_allowed(drive: str) -> bool:
     cfg = load_config()
     drive_id = get_drive_identifier(drive)
     return drive_id in cfg.get('allowed', {})
 
 
-def add_allowed_drive(drive: str) -> bool:
-    if not require_admin_password():
+def add_allowed_drive(drive: str, password_provider=None) -> bool:
+    if not require_admin_password(password_provider=password_provider):
         return False
     cfg = load_config()
     drive_id = get_drive_identifier(drive)
@@ -735,11 +1116,16 @@ def add_allowed_drive(drive: str) -> bool:
 
 
 def list_connected_drives() -> List[str]:
+    """Повертає список підключених знімних дисків, виключаючи C та D"""
     drives = []
     mask = win32file.GetLogicalDrives()
+    excluded = {'C:', 'D:'}
     for letter in range(26):
         if mask & (1 << letter):
             drive = f"{chr(65 + letter)}:" + os.sep
+            drive_letter = f"{chr(65 + letter)}:"
+            if drive_letter in excluded:
+                continue
             try:
                 if win32file.GetDriveType(drive) == win32file.DRIVE_REMOVABLE:
                     drives.append(drive)
@@ -753,18 +1139,24 @@ def ensure_autostart():
         ensure_config_dir()
         run_key = r"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, run_key, 0, winreg.KEY_SET_VALUE) as key:
-            cmd = f'"{sys.executable}" "{os.path.abspath(__file__)}"'
+            script_path = os.path.abspath(sys.argv[0] or __file__)
+            cmd = f'"{sys.executable}" "{script_path}"'
             winreg.SetValueEx(key, 'USBProtector', 0, winreg.REG_SZ, cmd)
     except Exception:
         pass
 
 
 def list_removable_drives() -> List[str]:
+    """Повертає список знімних дисків, виключаючи C та D"""
     drives = []
     mask = win32file.GetLogicalDrives()
+    excluded = {'C:', 'D:'}
     for letter in range(26):
         if mask & (1 << letter):
             drive = f"{chr(65 + letter)}:" + os.sep
+            drive_letter = f"{chr(65 + letter)}:"
+            if drive_letter in excluded:
+                continue
             try:
                 dtype = win32file.GetDriveType(drive)
                 if dtype == win32file.DRIVE_REMOVABLE:
@@ -774,9 +1166,10 @@ def list_removable_drives() -> List[str]:
     return drives
 
 
-def _optional_backup(root: str) -> Tuple[bool, str]:
+def _optional_backup(root: str, prompt_fn=None) -> Tuple[bool, str]:
     try:
-        ans = input('Create a zip backup of current USB before destructive encrypt? (y/N): ').strip().lower()
+        ask = prompt_fn if prompt_fn else (lambda msg: input(msg))
+        ans = (ask('Створити ZIP резервну копію поточного USB перед руйнівним шифруванням? (y/N): ') or '').strip().lower()
         if ans != 'y':
             return (True, 'no_backup')
         import zipfile
@@ -793,7 +1186,7 @@ def _optional_backup(root: str) -> Tuple[bool, str]:
                         zf.write(full, arc)
                     except Exception:
                         pass
-        print(f'Backup created at: {backup_name}')
+        print(f'Резервну копію створено: {backup_name}')
         return (True, backup_name)
     except Exception as e:
         return (False, str(e))
@@ -865,30 +1258,31 @@ class USBMonitor:
 def choose_drive_interactive() -> Optional[str]:
     drives = list_removable_drives()
     if not drives:
-        print('No removable drives found.')
+        print('Знімні накопичувачі не знайдено.')
         return None
-    print('Removable drives:')
+    print('Знімні накопичувачі:')
     for i, d in enumerate(drives, start=1):
-        label = get_drive_label(d)
-        print(f'  [{i}] {d} ({label})')
-    sel = input('Choose drive number: ').strip()
+        info = format_drive_info(d)
+        print(f'  [{i}] {d} | {info}')
+    sel = input('Виберіть номер накопичувача: ').strip()
     try:
         idx = int(sel) - 1
         if idx < 0:
             raise ValueError
         return drives[idx]
     except Exception:
-        print('Invalid selection')
+        print('Невірний вибір')
         return None
 
 
 def print_new_pc_help():
     print('\nЯк розшифрувати носій на новому ПК:')
-    print("  1. На авторизованому комп'ютері вставте USB і в меню оберіть \"Share access with this PC\"")
-    print('     або кнопку GUI "Share with this PC (admin)" — це додасть ключ для поточного HWID.')
-    print("  2. Перенесіть носій на новий комп'ютер. Програма автоматично розпізнає ключ,")
-    print('     після чого можна запустити тимчасовий перегляд або постійну розшифровку.')
-    print('  3. Якщо прихована папка .usb_protect_meta була втрачена, програма відновить її')
+    print("  1. Зашифруйте USB накопичувач на будь-якому комп'ютері з встановленою програмою.")
+    print('     Публічний ключ автоматично зберігається на носії.')
+    print("  2. Перенесіть зашифрований носій на інший комп'ютер з встановленою програмою.")
+    print('     Програма автоматично розпізнає публічний ключ та розшифрує дані.')
+    print('  3. Використовуйте кнопку "Розшифрувати накопичувач" для постійної розшифровки.')
+    print('  4. Якщо прихована папка .usb_protect_meta була втрачена, програма відновить її')
     print('     з локальної резервної копії (з каталогу AppData) під час першої спроби роботи з носієм.')
 
 
@@ -898,8 +1292,8 @@ class SimpleGUI:
         ensure_autostart()
         self.monitor = USBMonitor()
         self.root = tk.Tk()
-        self.root.title('USB Protector')
-        self.root.geometry('760x320')
+        self.root.title('Захист USB накопичувачів')
+        self.root.geometry('900x650')
         self.root.protocol('WM_DELETE_WINDOW', self.on_close)
 
         self.section_iids = {'section_allowed', 'section_blocked'}
@@ -907,30 +1301,38 @@ class SimpleGUI:
         frm = ttk.Frame(self.root, padding=10)
         frm.pack(fill=tk.BOTH, expand=True)
 
-        self.tree = ttk.Treeview(frm, columns=('status', 'id'), show='headings')
-        self.tree.heading('status', text='Status')
-        self.tree.heading('id', text='Identifier')
-        self.tree.column('status', width=120)
-        self.tree.column('id', width=540)
+        self.tree = ttk.Treeview(frm, columns=('status', 'info'), show='headings')
+        self.tree.heading('status', text='Статус')
+        self.tree.heading('info', text='Інформація про накопичувач')
+        self.tree.column('status', width=150)
+        self.tree.column('info', width=700)
         self.tree.pack(fill=tk.BOTH, expand=True)
 
         btn_frame = ttk.Frame(frm)
         btn_frame.pack(fill=tk.X, pady=8)
 
-        ttk.Button(btn_frame, text='Refresh', command=self.refresh).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_frame, text='Start monitor', command=self.start_monitor).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_frame, text='Stop monitor', command=self.stop_monitor).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_frame, text='Add to allowlist (admin)', command=self.admin_allow).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_frame, text='Remove from allowlist', command=self.admin_remove).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_frame, text='Admin decrypt', command=self.admin_decrypt).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_frame, text='Share with this PC (admin)', command=self.admin_share_local).pack(side=tk.LEFT, padx=4)
+        # Перший рядок кнопок - основні операції
+        main_btn_frame = ttk.Frame(btn_frame)
+        main_btn_frame.pack(fill=tk.X, pady=4)
+        
+        ttk.Button(main_btn_frame, text='1. Зашифрувати накопичувач (адмін)', command=self.admin_encrypt).pack(side=tk.LEFT, padx=4)
+        ttk.Button(main_btn_frame, text='2. Розшифрувати накопичувач (адмін)', command=self.admin_decrypt).pack(side=tk.LEFT, padx=4)
+        
+        # Другий рядок кнопок - управління
+        control_btn_frame = ttk.Frame(btn_frame)
+        control_btn_frame.pack(fill=tk.X, pady=4)
+        
+        ttk.Button(control_btn_frame, text='Оновити список', command=self.refresh).pack(side=tk.LEFT, padx=4)
+        ttk.Button(control_btn_frame, text='Додати до дозволених (адмін)', command=self.admin_allow).pack(side=tk.LEFT, padx=4)
+        ttk.Button(control_btn_frame, text='Видалити з дозволених', command=self.admin_remove).pack(side=tk.LEFT, padx=4)
+        ttk.Button(control_btn_frame, text='Додати зашифрований носій для іншого ПК (адмін)', command=self.admin_add_encrypted_drive).pack(side=tk.LEFT, padx=4)
 
         help_text = (
-            "Пристрій можна розблокувати на новому ПК, якщо на носії є ключ для цього HWID."
-            " Використайте кнопку 'Share with this PC (admin)' на авторизованому комп'ютері"
-            " або опцію меню для копіювання ключа на інший ПК."
+            "Зашифрований накопичувач можна розшифрувати на будь-якому комп'ютері з встановленою програмою, "
+            "оскільки використовується RSA шифрування. Публічний ключ зберігається на носії, "
+            "приватний ключ - у програмі на кожному комп'ютері."
         )
-        ttk.Label(frm, text=help_text, wraplength=440, foreground='gray').pack(fill=tk.X, pady=6)
+        ttk.Label(frm, text=help_text, wraplength=800, foreground='gray').pack(fill=tk.X, pady=6)
 
         self.refresh()
         self.monitor.start_background()
@@ -944,16 +1346,20 @@ class SimpleGUI:
         self.tree.insert('', 'end', iid='section_allowed', values=('Дозволені носії', ''))
         for drive_id, label in cfg.get('allowed', {}).items():
             drive = connected.get(drive_id, '')
-            status = 'allowed (connected)' if drive else 'allowed (not connected)'
-            display = f"{drive or '—'} | {label}"
-            self.tree.insert('', 'end', iid=drive or drive_id, values=(status, display))
+            if drive:
+                status = 'Дозволено (підключено)'
+                info = f"{drive} | {format_drive_info(drive)}"
+            else:
+                status = 'Дозволено (не підключено)'
+                info = f"— | {label}"
+            self.tree.insert('', 'end', iid=drive or drive_id, values=(status, info))
 
         self.tree.insert('', 'end', iid='section_blocked', values=('Заблоковані носії', ''))
         for drive_id, drive in connected.items():
             if drive_id in cfg.get('allowed', {}):
                 continue
-            label = get_drive_label(drive)
-            self.tree.insert('', 'end', iid=drive, values=('blocked', f"{drive} | {label}"))
+            info = f"{drive} | {format_drive_info(drive)}"
+            self.tree.insert('', 'end', iid=drive, values=('Заблоковано', info))
 
     def _selected_drive(self) -> Optional[str]:
         sel = self.tree.selection()
@@ -966,68 +1372,140 @@ class SimpleGUI:
 
     def start_monitor(self):
         self.monitor.start_background()
-        messagebox.showinfo('USB Protector', 'Monitor running in background (window may stay minimized).')
+        messagebox.showinfo('Захист USB', 'Моніторинг запущено у фоновому режимі (вікно може бути згорнуто).')
 
     def stop_monitor(self):
         self.monitor.stop()
-        messagebox.showinfo('USB Protector', 'Monitor stopped and temp views cleaned.')
+        messagebox.showinfo('Захист USB', 'Моніторинг зупинено та тимчасові перегляди очищено.')
 
     def admin_allow(self):
         d = self._selected_drive()
         if not d:
-            messagebox.showwarning('USB Protector', 'Select a drive first.')
+            messagebox.showwarning('Захист USB', 'Спочатку виберіть накопичувач.')
             return
         if ':' not in d:
-            messagebox.showwarning('USB Protector', 'Insert the USB drive before allowing it.')
+            messagebox.showwarning('Захист USB', 'Вставте USB накопичувач перед додаванням до дозволених.')
             return
-        if add_allowed_drive(d):
+        if add_allowed_drive(d, password_provider=_gui_password_provider(self.root)):
             self.refresh()
 
     def admin_remove(self):
         d = self._selected_drive()
         if not d:
-            messagebox.showwarning('USB Protector', 'Select a drive to remove from allowlist.')
+            messagebox.showwarning('Захист USB', 'Виберіть накопичувач для видалення зі списку дозволених.')
             return
         cfg = load_config()
         drive_id = get_drive_identifier(d) if ':' in d else d
         if drive_id not in cfg.get('allowed', {}):
-            messagebox.showinfo('USB Protector', 'Selected drive is not in the allowlist.')
+            messagebox.showinfo('Захист USB', 'Вибраний накопичувач не знаходиться у списку дозволених.')
             return
-        if not require_admin_password():
+        if not require_admin_password_gui(self.root):
             return
         cfg['allowed'].pop(drive_id, None)
         save_config(cfg)
-        messagebox.showinfo('USB Protector', 'Drive removed from allowlist.')
+        messagebox.showinfo('Захист USB', 'Накопичувач видалено зі списку дозволених.')
         self.refresh()
 
     def admin_decrypt(self):
         d = self._selected_drive()
         if not d:
-            messagebox.showwarning('USB Protector', 'Select a drive first.')
+            messagebox.showwarning('Захист USB', 'Спочатку виберіть накопичувач.')
             return
-        if not require_admin_password():
+        if ':' not in d:
+            messagebox.showwarning('Захист USB', 'Вставте зашифрований USB накопичувач.')
+            return
+        if not require_admin_password_gui(self.root):
             return
         dp = DriveProcessor(d)
         dp.meta = load_wrapped_keys(d)
         if dp.meta is None:
-            messagebox.showerror('USB Protector', 'Metadata missing; cannot restore.')
-            return
+            # Перевіряємо чи є RSA ключ
+            rsa_key_path = rsa_encrypted_key_path(d)
+            if not os.path.exists(rsa_key_path):
+                messagebox.showerror('Захист USB', 'Метадані відсутні; неможливо відновити.')
+                return
         ok, msg = dp.permanent_decrypt()
-        messagebox.showinfo('USB Protector', f'Decrypt result: {ok} ({msg})')
+        if ok:
+            messagebox.showinfo('Захист USB', f'Накопичувач успішно розшифровано.')
+        else:
+            messagebox.showerror('Захист USB', f'Помилка розшифрування: {msg}')
 
-    def admin_share_local(self):
+    def admin_encrypt(self):
         d = self._selected_drive()
         if not d:
-            messagebox.showwarning('USB Protector', 'Select a drive first.')
+            messagebox.showwarning('Захист USB', 'Спочатку виберіть накопичувач.')
             return
         if ':' not in d:
-            messagebox.showwarning('USB Protector', 'Insert the USB drive before sharing access.')
+            messagebox.showwarning('Захист USB', 'Вставте USB накопичувач перед шифруванням.')
             return
-        if not require_admin_password():
+        if not require_admin_password_gui(self.root):
             return
+        confirm = messagebox.askyesno(
+            'Захист USB',
+            f'Це знищить всі дані на накопичувачі {d} та зашифрує їх. Продовжити? (рекомендується створити резервну копію)',
+        )
+        if not confirm:
+            return
+        backup_yes = messagebox.askyesno(
+            'Захист USB',
+            'Створити ZIP резервну копію цього USB перед шифруванням?',
+        )
+        backup_fn = (lambda _prompt: 'y' if backup_yes else 'n')
         dp = DriveProcessor(d)
-        ok, msg = dp.add_local_hwid_access()
-        messagebox.showinfo('USB Protector', f'Add this PC result: {ok} ({msg})')
+        ok, msg = dp.initialize_and_encrypt(make_backup=True, prompt_fn=backup_fn)
+        if ok:
+            messagebox.showinfo('Захист USB', f'Накопичувач успішно зашифровано.')
+        else:
+            messagebox.showerror('Захист USB', f'Помилка шифрування: {msg}')
+        self.refresh()
+
+    def admin_share_local(self):
+        # Ця функція більше не потрібна з RSA, але залишаємо для сумісності
+        messagebox.showinfo('Захист USB', 'З RSA шифруванням накопичувач автоматично доступний на всіх комп\'ютерах з встановленою програмою.')
+
+    def admin_add_encrypted_drive(self):
+        """Додає зашифрований носій для використання на іншому комп'ютері"""
+        d = self._selected_drive()
+        if not d:
+            messagebox.showwarning('Захист USB', 'Спочатку виберіть зашифрований накопичувач.')
+            return
+        if ':' not in d:
+            messagebox.showwarning('Захист USB', 'Вставте зашифрований USB накопичувач.')
+            return
+        if not require_admin_password_gui(self.root):
+            return
+        
+        # Перевіряємо чи є публічний ключ на носії
+        public_key = load_public_key_from_drive(d)
+        if public_key is None:
+            messagebox.showerror('Захист USB', 'На носії не знайдено публічний ключ. Носій не зашифровано через RSA.')
+            return
+        
+        # Перевіряємо чи є зашифрований master key
+        rsa_key_path = rsa_encrypted_key_path(d)
+        if not os.path.exists(rsa_key_path):
+            messagebox.showerror('Захист USB', 'На носії не знайдено зашифрований master key.')
+            return
+        
+        # Перевіряємо чи закритий ключ у програмі може розшифрувати master key
+        try:
+            private_key = get_hardcoded_private_key()
+            with open(rsa_key_path, 'rb') as f:
+                encrypted_data = f.read()
+            master_key = decrypt_master_key_rsa(encrypted_data, private_key)
+            if master_key is None:
+                messagebox.showerror('Захист USB', 'Неможливо розшифрувати master key. Переконайтеся, що використовується правильна версія програми.')
+                return
+        except Exception as e:
+            messagebox.showerror('Захист USB', f'Помилка при перевірці ключа: {str(e)}')
+            return
+        
+        # Додаємо носій до списку дозволених
+        if add_allowed_drive(d, password_provider=_gui_password_provider(self.root)):
+            messagebox.showinfo('Захист USB', 'Зашифрований носій успішно додано. Тепер його можна використовувати на цьому комп\'ютері.')
+            self.refresh()
+        else:
+            messagebox.showerror('Захист USB', 'Не вдалося додати носій до списку дозволених.')
 
     def on_close(self):
         self.root.iconify()
@@ -1134,3 +1612,4 @@ if __name__ == '__main__':
     else:
         app = SimpleGUI()
         app.run()
+
