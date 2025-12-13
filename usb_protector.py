@@ -70,6 +70,12 @@ META_RSA_ENCRYPTED_KEY = "master_key.enc"
 FILE_TAG = b"USBPROT1"
 FILE_VERSION = 1
 POLL_INTERVAL = 2
+# Файли, які виглядають як тимчасові (наприклад, ~$word.docx), не передаємо на носій
+def is_transient_file(name: str) -> bool:
+    base = os.path.basename(name)
+    # Word та інші офісні додатки створюють службові файли, що починаються з '~'
+    return base.startswith('~')
+
 # Тимчасові файли на диску D
 def get_temp_root():
     """Повертає шлях для тимчасових файлів на диску D"""
@@ -660,6 +666,12 @@ def decrypt_content_bytes(raw: bytes, master_key: bytes) -> Optional[bytes]:
 def encrypt_and_obfuscate_file(path: str, root: str, master_key: bytes, mapping: dict) -> Optional[str]:
     try:
         rel = os.path.relpath(path, root)
+        if is_transient_file(rel):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+            return None
         with open(path, 'rb') as f:
             data = f.read()
         enc = encrypt_content_bytes(data, master_key)
@@ -690,6 +702,12 @@ def encrypt_and_obfuscate_file(path: str, root: str, master_key: bytes, mapping:
 
 def decrypt_token_to_path(root: str, token: str, orig_rel: str, master_key: bytes) -> bool:
     try:
+        if is_transient_file(orig_rel):
+            try:
+                os.remove(os.path.join(root, token))
+            except Exception:
+                pass
+            return True
         enc_path = os.path.join(root, token)
         if not os.path.exists(enc_path):
             return False
@@ -887,7 +905,15 @@ class DriveProcessor:
         if not payload or 'mapping' not in payload:
             print('No mapping metadata to build view.')
             return
-        mapping = payload['mapping']
+        mapping = {k: v for k, v in payload['mapping'].items() if not is_transient_file(v)}
+        if mapping != payload.get('mapping'):
+            # Очистити метадані та файли від службових тимчасових записів
+            for token in set(payload['mapping'].keys()) - set(mapping.keys()):
+                try:
+                    os.remove(os.path.join(self.root, token))
+                except Exception:
+                    pass
+            save_meta_encrypted(self.root, self.master_key, {'mapping': mapping, 'created_by': self.hwid}, self.meta)
         self._mapping = dict(mapping)
         self._reverse_mapping = {v: k for k, v in mapping.items()}
         os.makedirs(self.temp_dir, exist_ok=True)
@@ -992,6 +1018,8 @@ foreach ($window in $windows) {{
             for fn in filenames:
                 full = os.path.join(dirpath, fn)
                 rel = os.path.relpath(full, self.temp_dir).replace('\\', '/')
+                if is_transient_file(rel):
+                    continue
                 try:
                     stat = os.stat(full)
                     current_state[rel] = (stat.st_mtime, stat.st_size)
@@ -1008,6 +1036,13 @@ foreach ($window in $windows) {{
         self._last_view_state = current_state
 
     def _encrypt_back(self, rel: str):
+        if is_transient_file(rel):
+            # Не переносимо службові тимчасові файли на носій
+            try:
+                os.remove(os.path.join(self.temp_dir, rel.replace('/', os.sep)))
+            except Exception:
+                pass
+            return
         full = os.path.join(self.temp_dir, rel.replace('/', os.sep))
         try:
             with open(full, 'rb') as f:
