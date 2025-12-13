@@ -70,6 +70,12 @@ META_RSA_ENCRYPTED_KEY = "master_key.enc"
 FILE_TAG = b"USBPROT1"
 FILE_VERSION = 1
 POLL_INTERVAL = 2
+# Файли, які виглядають як тимчасові (наприклад, ~$word.docx), не передаємо на носій
+def is_transient_file(name: str) -> bool:
+    base = os.path.basename(name)
+    # Word та інші офісні додатки створюють службові файли, що починаються з '~'
+    return base.startswith('~')
+
 # Тимчасові файли на диску D
 def get_temp_root():
     """Повертає шлях для тимчасових файлів на диску D"""
@@ -88,7 +94,7 @@ CONFIG_PATH = os.path.join(CONFIG_ROOT, "config.json")
 RECOVERY_ROOT = os.path.join(CONFIG_ROOT, "recovery")
 PRIVATE_KEY_PATH = os.path.join(CONFIG_ROOT, "private_key.pem.enc")  # Зашифрований ключ
 PUBLIC_KEY_FILENAME = "public_key.pem"
-DEFAULT_ADMIN_PASSWORD = "1111"
+DEFAULT_ADMIN_HASH = "0ffe1abd1a08215353c233d6e009613e95eec4253832a761af28ff37ac5a150c"
 MAX_AUTO_DECRYPT = 300 * 1024 * 1024
 MAX_PASSWORD_ATTEMPTS = 5
 LOCKOUT_SECONDS = 30
@@ -118,18 +124,18 @@ def ensure_config_dir():
 def load_config() -> dict:
     ensure_config_dir()
     if not os.path.exists(CONFIG_PATH):
-        return {"admin_hash": _hash_password(DEFAULT_ADMIN_PASSWORD), "admin_must_change": True, "allowed": {}}
+        return {"admin_hash": DEFAULT_ADMIN_HASH, "admin_must_change": True, "allowed": {}}
     try:
         with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
             data = json.load(f)
         # Не встановлюємо admin_must_change = True, якщо він вже був змінений
         if "admin_must_change" not in data:
             data["admin_must_change"] = True
-        data.setdefault("admin_hash", _hash_password(DEFAULT_ADMIN_PASSWORD))
+        data.setdefault("admin_hash", DEFAULT_ADMIN_HASH)
         data.setdefault("allowed", {})
         return data
     except Exception:
-        return {"admin_hash": _hash_password(DEFAULT_ADMIN_PASSWORD), "admin_must_change": True, "allowed": {}}
+        return {"admin_hash": DEFAULT_ADMIN_HASH, "admin_must_change": True, "allowed": {}}
 
 
 def save_config(cfg: dict) -> None:
@@ -205,7 +211,7 @@ def require_admin_password(prompt: str = 'Admin password: ', password_provider=N
     cfg = load_config()
     # Перевіряємо чи потрібно змінити пароль тільки якщо він ще не був змінений
     if cfg.get('admin_must_change'):
-        pw = _get_password('Введіть пароль адміністратора за замовчуванням (1111) для встановлення нового: ', password_provider)
+        pw = _get_password('Введіть поточний пароль адміністратора для встановлення нового: ', password_provider)
         if _hash_password(pw) != cfg['admin_hash']:
             print('Пароль за замовчуванням не співпадає.')
             _PASSWORD_STATE["count"] += 1
@@ -660,6 +666,12 @@ def decrypt_content_bytes(raw: bytes, master_key: bytes) -> Optional[bytes]:
 def encrypt_and_obfuscate_file(path: str, root: str, master_key: bytes, mapping: dict) -> Optional[str]:
     try:
         rel = os.path.relpath(path, root)
+        if is_transient_file(rel):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+            return None
         with open(path, 'rb') as f:
             data = f.read()
         enc = encrypt_content_bytes(data, master_key)
@@ -690,6 +702,12 @@ def encrypt_and_obfuscate_file(path: str, root: str, master_key: bytes, mapping:
 
 def decrypt_token_to_path(root: str, token: str, orig_rel: str, master_key: bytes) -> bool:
     try:
+        if is_transient_file(orig_rel):
+            try:
+                os.remove(os.path.join(root, token))
+            except Exception:
+                pass
+            return True
         enc_path = os.path.join(root, token)
         if not os.path.exists(enc_path):
             return False
@@ -887,7 +905,15 @@ class DriveProcessor:
         if not payload or 'mapping' not in payload:
             print('No mapping metadata to build view.')
             return
-        mapping = payload['mapping']
+        mapping = {k: v for k, v in payload['mapping'].items() if not is_transient_file(v)}
+        if mapping != payload.get('mapping'):
+            # Очистити метадані та файли від службових тимчасових записів
+            for token in set(payload['mapping'].keys()) - set(mapping.keys()):
+                try:
+                    os.remove(os.path.join(self.root, token))
+                except Exception:
+                    pass
+            save_meta_encrypted(self.root, self.master_key, {'mapping': mapping, 'created_by': self.hwid}, self.meta)
         self._mapping = dict(mapping)
         self._reverse_mapping = {v: k for k, v in mapping.items()}
         os.makedirs(self.temp_dir, exist_ok=True)
@@ -992,6 +1018,8 @@ foreach ($window in $windows) {{
             for fn in filenames:
                 full = os.path.join(dirpath, fn)
                 rel = os.path.relpath(full, self.temp_dir).replace('\\', '/')
+                if is_transient_file(rel):
+                    continue
                 try:
                     stat = os.stat(full)
                     current_state[rel] = (stat.st_mtime, stat.st_size)
@@ -1008,6 +1036,13 @@ foreach ($window in $windows) {{
         self._last_view_state = current_state
 
     def _encrypt_back(self, rel: str):
+        if is_transient_file(rel):
+            # Не переносимо службові тимчасові файли на носій
+            try:
+                os.remove(os.path.join(self.temp_dir, rel.replace('/', os.sep)))
+            except Exception:
+                pass
+            return
         full = os.path.join(self.temp_dir, rel.replace('/', os.sep))
         try:
             with open(full, 'rb') as f:
@@ -1369,14 +1404,6 @@ class SimpleGUI:
         if iid in self.section_iids:
             return None
         return iid
-
-    def start_monitor(self):
-        self.monitor.start_background()
-        messagebox.showinfo('Захист USB', 'Моніторинг запущено у фоновому режимі (вікно може бути згорнуто).')
-
-    def stop_monitor(self):
-        self.monitor.stop()
-        messagebox.showinfo('Захист USB', 'Моніторинг зупинено та тимчасові перегляди очищено.')
 
     def admin_allow(self):
         d = self._selected_drive()
